@@ -855,6 +855,15 @@ public:
   const VariableDbgInfoMapTy &getVariableDbgInfo() const {
     return VariableDbgInfos;
   }
+
+  std::vector<unsigned> m_ssVarPhyRegs;
+  std::vector<unsigned> m_ssArgPhyRegs;
+  bool isSSPhyReg(unsigned phyReg) const;
+  bool hasSReg() {
+    if (m_ssVarPhyRegs.size() == 0 && m_ssArgPhyRegs.size() == 0) return false;
+    return true;
+  }
+  unsigned long uuidTop = 0, uuidBottom = 0;
 };
 
 /// \name Exception Handling

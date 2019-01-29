@@ -455,6 +455,36 @@ static void fixupCalleeSaveRestoreStackOffset(MachineInstr &MI,
   OffsetOpnd.setImm(OffsetOpnd.getImm() + LocalStackSize / 8);
 }
 
+#define UUIDGEN_CMD     "call"
+
+bool AArch64FrameLowering::getUUID(unsigned long *pTop, unsigned long *pBottom) const {
+  FILE *fp;
+  char uuid[64];
+  std::string top, bottom;
+
+  for(int tries = 0; tries < 100; tries++) {
+    fp = popen(UUIDGEN_PATH " " UUIDGEN_CMD, "r");
+    if (fp == NULL) return false;
+
+    while (fgets(uuid, sizeof(uuid)-1, fp));
+    // std::cout << "[" << uuid << "]" << std::endl;
+    uuid[strlen(uuid)-1] = '\0';
+    // std::cout << "[" << uuid << "] " << strlen(uuid) << std::endl;
+    top = uuid;
+    bottom = top.substr(19);
+    top = top.substr(0,18);
+
+    pclose(fp);
+
+    if (top.length() == 18 && bottom.length() == 18) break;
+  }   
+
+  *pTop = std::stoul(top, 0, 16);
+  *pBottom = std::stoul(bottom, 0, 16);
+
+  return true;
+}
+
 void AArch64FrameLowering::emitPrologue(MachineFunction &MF,
                                         MachineBasicBlock &MBB) const {
   MachineBasicBlock::iterator MBBI = MBB.begin();
@@ -477,6 +507,42 @@ void AArch64FrameLowering::emitPrologue(MachineFunction &MF,
   if (MF.getFunction()->getCallingConv() == CallingConv::GHC)
     return;
 
+  if (MF.hasSReg()) {
+    ymh_log() << "[PROLOGUE] in AArch64::emitPrologue(), " << Fn->getName() << "()'s first five instrs:\n";
+    int i = 5;
+    for(auto &mitr : MF.front()) {
+      ymh_log() <<"[PROLOGUE]      " << mitr;
+      if (!--i) break;
+    }
+
+      BuildMI(MBB, MBBI, DL, TII->get(AArch64::ORRXrs), AArch64::X15)
+      .addReg(AArch64::LR)
+      .addReg(AArch64::XZR)
+      .addImm(0).print("[LR_SPILL] ");
+
+    BuildMI(MBB, MBBI, DL, TII->get(AArch64::MOVi64imm), AArch64::X13)
+      .addImm(MF.uuidTop).print("[LR_SPILL] UUID_TOP ");
+
+    BuildMI(MBB, MBBI, DL, TII->get(AArch64::MOVi64imm), AArch64::X14)
+      .addImm(MF.uuidBottom).print("[LR_SPILL] UUID_BOTTOM ");
+
+    BuildMI(MBB, MBBI, DL, TII->get(AArch64::ADRP), AArch64::X12)
+      .addGlobalAddress(MF.getFunction()->getParent()->getNamedValue("__channel_access"));
+
+    BuildMI(MBB, MBBI, DL, TII->get(AArch64::ADDXri), AArch64::X12)
+      .addReg(AArch64::X12)
+      .addGlobalAddress(MF.getFunction()->getParent()->getNamedValue("__channel_access"), 0, AArch64II::MO_PAGEOFF | AArch64II::MO_NC)
+      .addImm(0);
+
+    BuildMI(MBB, MBBI, DL, TII->get(AArch64::LDRXui), AArch64::X12)
+      .addReg(AArch64::X12)
+      .addImm(1);
+
+    BuildMI(MBB, MBBI, DL, TII->get(AArch64::LDRXui), AArch64::X12)
+      .addReg(AArch64::X12)
+      .addImm(0);
+  }
+
   int NumBytes = (int)MFI.getStackSize();
   if (!AFI->hasStackFrame()) {
     assert(!HasFP && "unexpected function without stack frame but with FP");
@@ -491,6 +557,7 @@ void AArch64FrameLowering::emitPrologue(MachineFunction &MF,
     if (canUseRedZone(MF))
       ++NumRedZoneFunctions;
     else {
+      ymh_log() << "[PROLOGUE] OFFSET by #1\n";
       emitFrameOffset(MBB, MBBI, DL, AArch64::SP, AArch64::SP, -NumBytes, TII,
                       MachineInstr::FrameSetup);
 
@@ -516,10 +583,15 @@ void AArch64FrameLowering::emitPrologue(MachineFunction &MF,
 
   bool CombineSPBump = shouldCombineCSRLocalStackBump(MF, NumBytes);
   if (CombineSPBump) {
+    ymh_log() << "[PROLOGUE] OFFSET by #2 (" << -NumBytes << ")\n";
+
     emitFrameOffset(MBB, MBBI, DL, AArch64::SP, AArch64::SP, -NumBytes, TII,
                     MachineInstr::FrameSetup);
+
+    ymh_log() << "[PROLOGUE] OFFSET by #2 (" << -NumBytes << ") - done\n";
     NumBytes = 0;
   } else if (PrologueSaveSize != 0) {
+    ymh_log() << "[PROLOGUE] OFFSET by #2.5\n";
     MBBI = convertCalleeSaveRestoreToSPPrePostIncDec(MBB, MBBI, DL, TII,
                                                      -PrologueSaveSize);
     NumBytes -= PrologueSaveSize;
@@ -531,8 +603,15 @@ void AArch64FrameLowering::emitPrologue(MachineFunction &MF,
   // pointer bump above.
   MachineBasicBlock::iterator End = MBB.end();
   while (MBBI != End && MBBI->getFlag(MachineInstr::FrameSetup)) {
-    if (CombineSPBump)
+    if (CombineSPBump) {
+      ymh_log() << "[PROLOGUE] fixup\n";
+      ymh_log() << "[PROLOGUE] last opc: " << MBBI->getOpcode() << "\n";
+
       fixupCalleeSaveRestoreStackOffset(*MBBI, AFI->getLocalStackSize());
+
+      ymh_log() << "[PROLOGUE] after fixup\n";
+      ymh_log() << "[PROLOGUE] last opc: " << MBBI->getOpcode() << "\n";
+    }
     ++MBBI;
   }
   if (HasFP) {
@@ -541,6 +620,8 @@ void AArch64FrameLowering::emitPrologue(MachineFunction &MF,
     int FPOffset = AFI->getCalleeSavedStackSize() - 16;
     if (CombineSPBump)
       FPOffset += AFI->getLocalStackSize();
+    ymh_log() << "[PROLOGUE] OFFSET by #3 (" << FPOffset << ")\n";
+    ymh_log() << "[PROLOGUE] last opc: " << MBBI->getOpcode() << "\n";
 
     // Issue    sub fp, sp, FPOffset or
     //          mov fp,sp          when FPOffset is zero.
@@ -548,6 +629,8 @@ void AArch64FrameLowering::emitPrologue(MachineFunction &MF,
     // This code marks the instruction(s) that set the FP also.
     emitFrameOffset(MBB, MBBI, DL, AArch64::FP, AArch64::SP, FPOffset, TII,
                     MachineInstr::FrameSetup);
+
+    ymh_log() << "[PROLOGUE] OFFSET by #3 (" << FPOffset << ") - done\n";
   }
 
   // Allocate space for the rest of the frame.
@@ -561,18 +644,22 @@ void AArch64FrameLowering::emitPrologue(MachineFunction &MF,
     }
 
     // If we're a leaf function, try using the red zone.
-    if (!canUseRedZone(MF))
+    if (!canUseRedZone(MF)) {
+      ymh_log() << "[PROLOGUE] OFFSET by #4\n";
       // FIXME: in the case of dynamic re-alignment, NumBytes doesn't have
       // the correct value here, as NumBytes also includes padding bytes,
       // which shouldn't be counted here.
       emitFrameOffset(MBB, MBBI, DL, scratchSPReg, AArch64::SP, -NumBytes, TII,
                       MachineInstr::FrameSetup);
+    }
 
     if (NeedsRealignment) {
       const unsigned Alignment = MFI.getMaxAlignment();
       const unsigned NrBitsToZero = countTrailingZeros(Alignment);
       assert(NrBitsToZero > 1);
       assert(scratchSPReg != AArch64::SP);
+
+      ymh_log() << "[PROLOGUE] OFFSET by #5\n";
 
       // SUB X9, SP, NumBytes
       //   -- X9 is temporary register, so shouldn't contain any live data here,
@@ -600,6 +687,7 @@ void AArch64FrameLowering::emitPrologue(MachineFunction &MF,
   // Note: Use emitFrameOffset() like above for FP if the FrameSetup flag is
   // needed.
   if (RegInfo->hasBasePointer(MF)) {
+    ymh_log() << "[PROLOGUE] OFFSET by #6\n";
     TII->copyPhysReg(MBB, MBBI, DL, RegInfo->getBaseRegister(), AArch64::SP,
                      false);
   }
@@ -608,6 +696,9 @@ void AArch64FrameLowering::emitPrologue(MachineFunction &MF,
     const DataLayout &TD = MF.getDataLayout();
     const int StackGrowth = -TD.getPointerSize(0);
     unsigned FramePtr = RegInfo->getFrameRegister(MF);
+
+    ymh_log() << "[PROLOGUE] Move callee-saved regs\n";
+
     // An example of the prologue:
     //
     //     .globl __foo
@@ -714,7 +805,7 @@ void AArch64FrameLowering::emitEpilogue(MachineFunction &MF,
   int NumBytes = MFI.getStackSize();
   const AArch64FunctionInfo *AFI = MF.getInfo<AArch64FunctionInfo>();
 
-  // All calls are tail calls in GHC calling conv, and functions have no
+    // All calls are tail calls in GHC calling conv, and functions have no
   // prologue/epilogue.
   if (MF.getFunction()->getCallingConv() == CallingConv::GHC)
     return;
@@ -785,6 +876,36 @@ void AArch64FrameLowering::emitEpilogue(MachineFunction &MF,
       break;
     } else if (CombineSPBump)
       fixupCalleeSaveRestoreStackOffset(*LastPopI, AFI->getLocalStackSize());
+  }
+
+  if (MF.hasSReg()) {
+    ymh_log() << "[LR_RESTORE] " << MF.getName() << "()'s last three instr (backwards):\n";// << *MBBI << "\n";
+    MachineBasicBlock::iterator tempMBBI = MBB.getLastNonDebugInstr();
+    for (int i = 0; i < 3 && tempMBBI != MBB.begin(); tempMBBI--, i++) {
+      ymh_log() << "[LR_RESTORE]        " << *tempMBBI;
+    }
+
+    BuildMI(MBB, MBBI, DL, TII->get(AArch64::MOVi64imm), AArch64::X13)
+      .addImm(MF.uuidTop).print("[LR_SPILL] UUID_TOP ");
+
+    BuildMI(MBB, MBBI, DL, TII->get(AArch64::MOVi64imm), AArch64::X14)
+      .addImm(MF.uuidBottom).print("[LR_SPILL] UUID_BOTTOM ");
+
+    BuildMI(MBB, MBBI, DL, TII->get(AArch64::ADRP), AArch64::X4)
+      .addGlobalAddress(MF.getFunction()->getParent()->getNamedValue("__channel_access"));
+
+    BuildMI(MBB, MBBI, DL, TII->get(AArch64::ADDXri), AArch64::X4)
+      .addReg(AArch64::X4)
+      .addGlobalAddress(MF.getFunction()->getParent()->getNamedValue("__channel_access"), 0, AArch64II::MO_PAGEOFF | AArch64II::MO_NC)
+      .addImm(0);
+
+    BuildMI(MBB, MBBI, DL, TII->get(AArch64::LDRXui), AArch64::X4)
+      .addReg(AArch64::X4)
+      .addImm(2);
+
+    BuildMI(MBB, MBBI, DL, TII->get(AArch64::LDRXui), AArch64::X4)
+      .addReg(AArch64::X4)
+      .addImm(0);
   }
 
   // If there is a single SP update, insert it before the ret and we're done.
@@ -1157,6 +1278,7 @@ void AArch64FrameLowering::determineCalleeSaves(MachineFunction &MF,
   if (MF.getFunction()->getCallingConv() == CallingConv::GHC)
     return;
 
+  ymh_log() << "[LR_SPILL] bitvec count: " << SavedRegs.count() << " - before ::determine()\n";
   TargetFrameLowering::determineCalleeSaves(MF, SavedRegs, RS);
   const AArch64RegisterInfo *RegInfo = static_cast<const AArch64RegisterInfo *>(
       MF.getSubtarget().getRegisterInfo());
@@ -1164,6 +1286,7 @@ void AArch64FrameLowering::determineCalleeSaves(MachineFunction &MF,
   unsigned UnspilledCSGPR = AArch64::NoRegister;
   unsigned UnspilledCSGPRPaired = AArch64::NoRegister;
 
+  ymh_log() << "[LR_SPILL] bitvec count: " << SavedRegs.count() << " - after ::determine()\n";
   // The frame record needs to be created by saving the appropriate registers
   if (hasFP(MF)) {
     SavedRegs.set(AArch64::FP);
@@ -1181,8 +1304,10 @@ void AArch64FrameLowering::determineCalleeSaves(MachineFunction &MF,
     const unsigned Reg = CSRegs[i];
 
     // Add the base pointer register to SavedRegs if it is callee-save.
-    if (Reg == BasePointerReg)
+    if (Reg == BasePointerReg) {
+      ymh_log() << "[LR_SPILL] #1 " << MF.getFunction()->getName() << "() spills " << Reg << "\n";
       SavedRegs.set(Reg);
+    }
 
     bool RegUsed = SavedRegs.test(Reg);
     unsigned PairedReg = CSRegs[i ^ 1];
@@ -1199,6 +1324,7 @@ void AArch64FrameLowering::determineCalleeSaves(MachineFunction &MF,
     // pairs.
     // FIXME: the usual format is actually better if unwinding isn't needed.
     if (produceCompactUnwindFrame(MF) && !SavedRegs.test(PairedReg)) {
+      ymh_log() << "[LR_SPILL] #2 " << MF.getFunction()->getName() << "() spills pair " << PairedReg << "\n";
       SavedRegs.set(PairedReg);
       if (AArch64::GPR64RegClass.contains(PairedReg) &&
           !RegInfo->isReservedReg(MF, PairedReg))
@@ -1235,12 +1361,15 @@ void AArch64FrameLowering::determineCalleeSaves(MachineFunction &MF,
     if (!ExtraCSSpill && UnspilledCSGPR != AArch64::NoRegister) {
       DEBUG(dbgs() << "Spilling " << PrintReg(UnspilledCSGPR, RegInfo)
             << " to get a scratch register.\n");
+      ymh_log() << "[LR_SPILL] #3 " << MF.getFunction()->getName() << "() spills " << UnspilledCSGPR << "\n";
       SavedRegs.set(UnspilledCSGPR);
       // MachO's compact unwind format relies on all registers being stored in
       // pairs, so if we need to spill one extra for BigStack, then we need to
       // store the pair.
-      if (produceCompactUnwindFrame(MF))
+      if (produceCompactUnwindFrame(MF)) {
+        ymh_log() << "[LR_SPILL] #4 " << MF.getFunction()->getName() << "() spills pair " << UnspilledCSGPRPaired << "\n";
         SavedRegs.set(UnspilledCSGPRPaired);
+      }
       ExtraCSSpill = UnspilledCSGPRPaired;
       NumRegsSpilled = SavedRegs.count();
     }

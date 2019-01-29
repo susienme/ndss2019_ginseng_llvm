@@ -280,6 +280,16 @@ public:
     MI->copyImplicitOps(*MF, OtherMI);
     return *this;
   }
+
+  const MachineInstrBuilder &addTagNo(int tagNo) const {
+    MI->m_varTagNo = tagNo;
+    return *this;
+  }
+
+  const MachineInstrBuilder &print(std::string strPrefix) const {
+    ymh_log() << strPrefix << "MachineInstr: " << *MI;// << "\n";
+    return *this;
+  }
 };
 
 /// Builder interface. Specify how to create the initial instruction itself.

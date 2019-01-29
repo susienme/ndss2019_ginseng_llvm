@@ -49,6 +49,8 @@ using namespace llvm;
 
 #define DEBUG_TYPE "prologepilog"
 
+#define UUIDGEN_CMD     "call"
+
 typedef SmallVector<MachineBasicBlock *, 4> MBBVector;
 static void doSpillCalleeSavedRegs(MachineFunction &MF, RegScavenger *RS,
                                    unsigned &MinCSFrameIndex,
@@ -121,6 +123,7 @@ private:
   void replaceFrameIndices(MachineBasicBlock *BB, MachineFunction &Fn,
                            int &SPAdj);
   void insertPrologEpilogCode(MachineFunction &Fn);
+  bool getUUID(unsigned long *pTop, unsigned long *pBottom);
 };
 } // namespace
 
@@ -162,6 +165,34 @@ void PEI::getAnalysisUsage(AnalysisUsage &AU) const {
 /// StackObjSet - A set of stack object indexes
 typedef SmallSetVector<int, 8> StackObjSet;
 
+bool PEI::getUUID(unsigned long *pTop, unsigned long *pBottom) {
+  FILE *fp;
+  char uuid[64];
+  std::string top, bottom;
+
+  for(int tries = 0; tries < 100; tries++) {
+    fp = popen(UUIDGEN_PATH " " UUIDGEN_CMD, "r");
+    if (fp == NULL) return false;
+
+    while (fgets(uuid, sizeof(uuid)-1, fp));
+    // std::cout << "[" << uuid << "]" << std::endl;
+    uuid[strlen(uuid)-1] = '\0';
+    // std::cout << "[" << uuid << "] " << strlen(uuid) << std::endl;
+    top = uuid;
+    bottom = top.substr(19);
+    top = top.substr(0,18);
+
+    pclose(fp);
+
+    if (top.length() == 18 && bottom.length() == 18) break;
+  }   
+
+  *pTop = std::stoul(top, 0, 16);
+  *pBottom = std::stoul(bottom, 0, 16);
+
+  return true;
+}
+
 /// runOnMachineFunction - Insert prolog/epilog code and replace abstract
 /// frame indexes with appropriate references.
 ///
@@ -199,6 +230,17 @@ bool PEI::runOnMachineFunction(MachineFunction &Fn) {
   // place all spills in the entry block, all restores in return blocks.
   calculateSaveRestoreBlocks(Fn);
 
+  // check the first instr
+  ymh_log() << "[PROLOGUE] " << F->getName() << "()'s first instr: " << Fn.front().front();
+  if (Fn.hasSReg()) {
+    unsigned long uuidTop, uuidBottom;
+    ymh_log() << "[PROLOGUE] nrVarPhyRegs(" << Fn.m_ssVarPhyRegs.size() << ") nrArgPhyRegs(" << Fn.m_ssArgPhyRegs.size() << ")\n";
+    if (!getUUID(&uuidTop, &uuidBottom)) {
+      ymh_log() << "CAN'T GET UUID\n";
+      exit(1);
+    }
+  }
+  
   // Handle CSR spilling and restoring, for targets that need it.
   SpillCalleeSavedRegisters(Fn, RS, MinCSFrameIndex, MaxCSFrameIndex,
                             SaveBlocks, RestoreBlocks);
@@ -209,6 +251,9 @@ bool PEI::runOnMachineFunction(MachineFunction &Fn) {
 
   // Calculate actual frame offsets for all abstract stack objects...
   calculateFrameObjectOffsets(Fn);
+
+  // check the first instr
+  ymh_log() << "[PROLOGUE] " << F->getName() << "()'s first instr opc: " << Fn.front().front() << "\n";
 
   // Add prolog and epilog code to the function.  This function is required
   // to align the stack frame as necessary for any stack variables or
@@ -975,6 +1020,18 @@ void PEI::calculateFrameObjectOffsets(MachineFunction &Fn) {
 ///
 void PEI::insertPrologEpilogCode(MachineFunction &Fn) {
   const TargetFrameLowering &TFI = *Fn.getSubtarget().getFrameLowering();
+
+  /* Before inserting prologue and epilogue,
+   * we assign uuid if the function has SReg
+   */
+  if (Fn.hasSReg()) {
+    // unsigned long uuidTop, uuidBottom;
+    if (!getUUID(&Fn.uuidTop, &Fn.uuidBottom)) {
+      ymh_log() << "CAN'T GET UUID\n";
+      exit(1);
+    }
+    ymh_log() << Fn.getName() << "()'s UUID TOP(" << format_hex(Fn.uuidTop, 18) << ") BOTTOM(" << format_hex(Fn.uuidBottom, 18) << ")\n";
+  }
 
   // Add prologue to the function...
   for (MachineBasicBlock *SaveBlock : SaveBlocks)

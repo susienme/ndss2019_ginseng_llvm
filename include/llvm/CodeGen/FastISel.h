@@ -31,6 +31,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <utility>
+#include "llvm/CodeGen/ginseng.h"
 
 namespace llvm {
 
@@ -319,6 +320,30 @@ public:
 
   /// \brief Reset InsertPt to the given old insert position.
   void leaveLocalValueArea(SavePoint Old);
+  
+  MDNode* getSSAnnotation(const Instruction *I);
+  int getSSVarTagNo(const Instruction *I);
+  int getSSArgTagNo(const Instruction *I);
+  virtual void ginsengEmitAlloc(const Instruction *I/*, const unsigned vreg*/) {};
+  
+  DenseMap<const Function *, unsigned>                                    &m_func2nrSSVarVRegs;        // Function -> nr(VREGs)
+  DenseMap<const Function *, DenseMap<int, unsigned>*>                    &m_func2VarTag2vreg;         // Function -> tag2vreg
+  DenseMap<const Function *, DenseMap<unsigned, std::vector<unsigned>*>*> &m_func2VarVReg2addedVRegs;  // Function -> vreg2addedVregs
+
+  DenseMap<const Function *, unsigned>                                    &m_func2nrSSArgVRegs;       // Function -> nr(VREGs)
+  DenseMap<const Function *, DenseMap<int, unsigned>*>                    &m_func2ArgTag2vreg;        // Function -> tag2vreg
+  DenseMap<const Function *, DenseMap<unsigned, std::vector<unsigned>*>*> &m_func2ArgVReg2addedVRegs; // Function -> vreg2addedVregs
+  DenseMap<const Function *, DenseMap<unsigned, unsigned>*>               &m_func2vreg2argIdx;        // Function -> vreg2argIdx
+  
+  // these are for XCall support
+  const BasicBlock *m_pCurBB;
+  BasicBlock::const_iterator m_curBI;
+  DenseMap<const CallInst *, std::vector<std::pair<const LoadInst*, int>>> m_callingSaveCleanV2LoadInstrArgnos;
+  DenseMap<const CallInst *, std::vector<std::pair<unsigned, int>>> m_callingSaveCleanV2vregOrgArgnos;
+  DenseMap<const Value *, std::vector<std::pair<unsigned, int>>> m_saveClenVOP2vregOrgArgnos;
+  void initXCallSupport();
+
+  const Instruction *m_pCurInstr = NULL;
 
 protected:
   explicit FastISel(FunctionLoweringInfo &FuncInfo,

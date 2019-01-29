@@ -1378,6 +1378,8 @@ void FastISel::removeDeadLocalValueCode(MachineInstr *SavedLastLocalValue)
 }
 
 bool FastISel::selectInstruction(const Instruction *I) {
+  m_pCurInstr = I;
+
   MachineInstr *SavedLastLocalValue = getLastLocalValue();
   // Just before the terminator instruction, insert instructions to
   // feed PHI nodes in successor blocks.
@@ -1705,7 +1707,15 @@ FastISel::FastISel(FunctionLoweringInfo &FuncInfo,
       TII(*MF->getSubtarget().getInstrInfo()),
       TLI(*MF->getSubtarget().getTargetLowering()),
       TRI(*MF->getSubtarget().getRegisterInfo()), LibInfo(LibInfo),
-      SkipTargetIndependentISel(SkipTargetIndependentISel) {}
+      SkipTargetIndependentISel(SkipTargetIndependentISel),
+      m_func2nrSSVarVRegs(MF->getContext().m_func2nrSSVarVRegs),
+      m_func2VarTag2vreg(MF->getContext().m_func2VarTag2vreg),
+      m_func2VarVReg2addedVRegs(MF->getContext().m_func2VarVReg2addedVRegs),
+      m_func2nrSSArgVRegs(MF->getContext().m_func2nrSSArgVRegs),
+      m_func2ArgTag2vreg(MF->getContext().m_func2ArgTag2vreg),
+      m_func2ArgVReg2addedVRegs(MF->getContext().m_func2ArgVReg2addedVRegs),
+      m_func2vreg2argIdx(MF->getContext().m_func2vreg2argIdx)
+      {}
 
 FastISel::~FastISel() = default;
 
@@ -2253,4 +2263,73 @@ CmpInst::Predicate FastISel::optimizeCmpPredicate(const CmpInst *CI) const {
   }
 
   return Predicate;
+}
+
+MDNode* FastISel::getSSAnnotation(const Instruction *I) {
+  const std::string annotation = "SS_VAR";
+  MDNode *pMDNode;
+  if ( I->hasMetadata() ) {
+    // non-postfixed
+    if ( (pMDNode = I->getMetadata(annotation)) ) return pMDNode;
+
+    // postfixed
+    for (int i = 0; i < NR_MAX_SS_DATA_VAR; i++) {
+      std::string postfixedAnnon = annotation + std::to_string(i);
+      if ( (pMDNode = I->getMetadata(postfixedAnnon)) ) {
+        ymh_log() << "LOAD has annotation KindID(" << postfixedAnnon << ")\n";
+        return pMDNode;
+      }
+    }
+  }
+
+  return nullptr;
+}
+
+
+// assume SS_VAR has postfix e.g., SS_VAR0 ... SS_VAR5
+int FastISel::getSSVarTagNo(const Instruction *I) {
+  const std::string annotation = "SS_VAR";
+  MDNode *pMDNode;
+  if ( I->hasMetadata() ) {
+    // postfixed
+    for (int i = 0; i < NR_MAX_SS_DATA_VAR; i++) {
+      std::string postfixedAnnon = annotation + std::to_string(i);
+      if ( (pMDNode = I->getMetadata(postfixedAnnon)) ) {
+        int tagNo = std::stoi(postfixedAnnon.substr(annotation.length()));
+        ymh_log() << "LOAD has annotation varTagNO(" 
+                  << tagNo
+                  << ")\n";
+        return tagNo;
+      }
+    }
+  }
+
+  return -1;
+}
+
+// assume SS_VAR has postfix e.g., SS_ARG0 ... SS_ARG5
+int FastISel::getSSArgTagNo(const Instruction *I) {
+  const std::string annotation = "SS_ARG";
+  MDNode *pMDNode;
+  if ( I->hasMetadata() ) {
+    // postfixed
+    for (int i = 0; i < NR_MAX_SS_DATA_VAR; i++) {
+      std::string postfixedAnnon = annotation + std::to_string(i);
+      if ( (pMDNode = I->getMetadata(postfixedAnnon)) ) {
+        int tagNo = std::stoi(postfixedAnnon.substr(annotation.length()));
+        ymh_log() << "LOAD has annotation argTagNO(" 
+                  << tagNo
+                  << ")\n";
+        return tagNo;
+      }
+    }
+  }
+
+  return -1;
+}
+
+void FastISel::initXCallSupport() {
+  m_callingSaveCleanV2LoadInstrArgnos.clear();
+  m_callingSaveCleanV2vregOrgArgnos.clear();
+  m_saveClenVOP2vregOrgArgnos.clear();
 }

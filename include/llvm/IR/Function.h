@@ -729,6 +729,26 @@ private:
     Value::setValueSubclassData(D);
   }
   void setValueSubclassDataBit(unsigned Bit, bool On);
+public:
+  typedef enum
+  {
+    WITH_SS_DATA,
+    WITHOUT_SS_DATA,
+    UNKNOWN
+  } withSSData;
+  withSSData m_withSSData = UNKNOWN;
+  std::string getSSDataStr() {
+    switch (m_withSSData) {
+    case WITH_SS_DATA:
+      return std::string("WITH_SS_DATA");
+    case WITHOUT_SS_DATA:
+      return std::string("WITHOUT_SS_DATA");
+    case UNKNOWN:
+      return std::string("UNKNOWN");
+    }
+
+    return std::string("WHO ARE YOU?");
+  }
 };
 
 template <>

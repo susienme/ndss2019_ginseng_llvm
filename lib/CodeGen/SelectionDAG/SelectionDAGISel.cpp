@@ -97,6 +97,7 @@
 #include <string>
 #include <utility>
 #include <vector>
+#include "llvm/CodeGen/ginseng.h"
 
 using namespace llvm;
 
@@ -316,6 +317,7 @@ SelectionDAGISel::SelectionDAGISel(TargetMachine &tm,
   }
 
 SelectionDAGISel::~SelectionDAGISel() {
+  ymh_log() << "DAGISel dies with " << CurDAG->allnodes_size() << " nodes\n";
   delete SDB;
   delete CurDAG;
   delete FuncInfo;
@@ -411,6 +413,8 @@ bool SelectionDAGISel::runOnMachineFunction(MachineFunction &mf) {
   LoopInfo *LI = LIWP ? &LIWP->getLoopInfo() : nullptr;
 
   DEBUG(dbgs() << "\n\n\n=== " << Fn.getName() << "\n");
+  errs() << "\n";
+  ymh_log() << YMH_COLOR_CYAN << "SelectionDAGISel::runOnMachineFunction on " << Fn.getName() << "()\n" << YMH_COLOR_RESET;
 
   SplitCriticalSideEffectEdges(const_cast<Function &>(Fn), DT, LI);
 
@@ -463,7 +467,9 @@ bool SelectionDAGISel::runOnMachineFunction(MachineFunction &mf) {
     // This performs initialization so lowering for SplitCSR will be correct.
     TLI->initializeSplitCSR(EntryMBB);
 
-  SelectAllBasicBlocks(Fn);
+  // NOTE: CurDAG is initialized above; it means it has only a single SDNode.
+  ymh_log() << "Calling SelectAllBasicBlocks()\n";
+  SelectAllBasicBlocks(Fn); // <=================================================== SELECT!
   if (FastISelFailed && EnableFastISelFallbackReport) {
     DiagnosticInfoISelFallback DiagFallback(Fn);
     Fn.getContext().diagnose(DiagFallback);
@@ -661,6 +667,7 @@ void SelectionDAGISel::SelectBasicBlock(BasicBlock::const_iterator Begin,
   HadTailCall = SDB->HasTailCall;
   SDB->clear();
 
+  ymh_log() << "Calling CodeGenAndEmitDAG() in SelectBasicBlock()\n";
   // Final step, emit the lowered DAG as machine code.
   CodeGenAndEmitDAG();
 }
@@ -735,7 +742,7 @@ void SelectionDAGISel::CodeGenAndEmitDAG() {
         << " '" << BlockName << "'\n"; CurDAG->dump());
 
   if (ViewDAGCombine1 && MatchFilterBB)
-    CurDAG->viewGraph("dag-combine1 input for " + BlockName);
+    CurDAG->viewGraph("dag-combine1 input for " + BlockName);       // <---------------------- allocate a SDNode ?
 
   // Run the DAG combiner in pre-legalize mode.
   {
@@ -893,8 +900,12 @@ void SelectionDAGISel::CodeGenAndEmitDAG() {
     delete Scheduler;
   }
 
+  ymh_log() << "Clearing CurDag with " << CurDAG->allnodes_size() << "nodes\n";
+
   // Free the SelectionDAG state, now that we're finished with it.
   CurDAG->clear();
+
+  ymh_log() << "Cleared CurDag with " << CurDAG->allnodes_size() << "nodes\n";
 }
 
 namespace {
@@ -1387,6 +1398,7 @@ void SelectionDAGISel::SelectAllBasicBlocks(const Function &Fn) {
     // See if fast isel can lower the arguments.
     FastIS->startNewBlock();
     if (!FastIS->lowerArguments()) {
+      ymh_log() << "FastIS cannot lower args\n";
       FastISelFailed = true;
       // Fast isel failed to lower these arguments
       ++NumFastIselFailLowerArguments;
@@ -1404,6 +1416,9 @@ void SelectionDAGISel::SelectAllBasicBlocks(const Function &Fn) {
       SDB->clear();
       CodeGenAndEmitDAG();
     }
+    else ymh_log() << "FastIS can lower args\n";
+
+    if (FuncInfo->InsertPt != FuncInfo->MBB->begin()) ymh_log() << "Need to set the last local var\n";
 
     // If we inserted any instructions at the beginning, make a note of
     // where they are, so we can be sure to emit subsequent instructions
@@ -1417,8 +1432,10 @@ void SelectionDAGISel::SelectAllBasicBlocks(const Function &Fn) {
 
   processDbgDeclares(FuncInfo);
 
+  int bb_counter = 0;
   // Iterate over all basic blocks in the function.
-  for (const BasicBlock *LLVMBB : RPOT) {
+  for (const BasicBlock *LLVMBB : RPOT) { //////////////////////////// YMH_NOTE: FOR EACH BB in REVERED ORDER
+    ymh_log() << "Revered BB #" << bb_counter << "\n";
     if (OptLevel != CodeGenOpt::None) {
       bool AllPredsVisited = true;
       for (const_pred_iterator PI = pred_begin(LLVMBB), PE = pred_end(LLVMBB);
@@ -1472,8 +1489,26 @@ void SelectionDAGISel::SelectAllBasicBlocks(const Function &Fn) {
       preassignSwiftErrorRegs(TLI, FuncInfo, Begin, End);
 
       // Do FastISel on as many instructions as possible.
-      for (; BI != Begin; --BI) {
+      for (; BI != Begin; --BI) { //////////////////////////// YMH_NOTE: FOR EACH INSTR in REVERSED ORDER
         const Instruction *Inst = &*std::prev(BI);
+        int tagNo = FastIS->getSSVarTagNo(Inst);
+        if (Inst->getOpcode() == Instruction::Alloca && tagNo != -1) {
+          ymh_log() << "MUST NOT BE -1: " << tagNo << "\n";
+          Inst->print(ymh_log() << "VISIT_INSTR: "); errs() << "\n";
+          ymh_log() << YMH_COLOR_RED << "FOUND an ALLOCA" << YMH_COLOR_RESET << "\n";
+
+          // Bottom-up: reset the insert pos at the top, after any local-value
+          // instructions.
+          FastIS->recomputeInsertPt();
+
+          FastIS->ginsengEmitAlloc(Inst);
+          ymh_log() << "must be 1: " << (isFoldedOrDeadInstruction(Inst, FuncInfo) ||
+                                         ElidedArgCopyInstrs.count(Inst)) << "\n";
+
+          --NumFastIselRemaining;
+          ++NumFastIselSuccess;
+          
+        }
 
         // If we no longer require this instruction, skip it.
         if (isFoldedOrDeadInstruction(Inst, FuncInfo) ||
@@ -1486,8 +1521,21 @@ void SelectionDAGISel::SelectAllBasicBlocks(const Function &Fn) {
         // instructions.
         FastIS->recomputeInsertPt();
 
+        errs() << "\n";
+        ymh_log() << "Trying FastIS for                "; //\"" << Inst->getOpcodeName() << "\"\n";
+        if (Inst->hasMetadata()) Inst->print(errs() << YMH_COLOR_BRIGHT_RED); 
+        else Inst->print(errs() << YMH_COLOR_BRIGHT_BLACK); 
+        errs() << YMH_COLOR_RESET << "\n";
+
+        FastIS->m_pCurBB = LLVMBB;
+        FastIS->m_curBI = BI;
+        FastIS->m_curBI--;
         // Try to select the instruction with FastISel.
         if (FastIS->selectInstruction(Inst)) {
+          ymh_log() << "FastIS succeeded select instr for"; //\"" << Inst->getOpcodeName() << "\"\n";
+          if (Inst->hasMetadata()) Inst->print(errs() << YMH_COLOR_BRIGHT_RED);
+          else Inst->print(errs() << YMH_COLOR_BRIGHT_BLACK); 
+          errs() << YMH_COLOR_RESET << "\n";
           --NumFastIselRemaining;
           ++NumFastIselSuccess;
           // If fast isel succeeded, skip over all the folded instructions, and
@@ -1507,8 +1555,9 @@ void SelectionDAGISel::SelectAllBasicBlocks(const Function &Fn) {
             --NumFastIselRemaining;
             ++NumFastIselSuccess;
           }
-          continue;
+          continue;   // <------------------ LOOK!
         }
+        ymh_log() << "FastIS failed select instr for" << YMH_COLOR_BRIGHT_BLACK << Inst->getOpcodeName() << YMH_COLOR_RESET << "\n";
 
         FastISelFailed = true;
 
@@ -1542,7 +1591,9 @@ void SelectionDAGISel::SelectAllBasicBlocks(const Function &Fn) {
 
           bool HadTailCall = false;
           MachineBasicBlock::iterator SavedInsertPt = FuncInfo->InsertPt;
+          ymh_log() << "Calling SelectBasicBlock() #1\n";
           SelectBasicBlock(Inst->getIterator(), BI, HadTailCall);
+          ymh_log() << "Calling SelectBasicBlock() #1 - RETRUNED\n";
 
           // If the call was emitted as a tail call, we're done with the block.
           // We also need to delete any previously emitted instructions.
@@ -1584,7 +1635,7 @@ void SelectionDAGISel::SelectAllBasicBlocks(const Function &Fn) {
 
         NumFastIselFailures += NumFastIselRemaining;
         break;
-      }
+      } //////////////////////////// YMH_NOTE: loop for each Instruction
 
       FastIS->recomputeInsertPt();
     }
@@ -1606,6 +1657,7 @@ void SelectionDAGISel::SelectAllBasicBlocks(const Function &Fn) {
       // not handled by FastISel. If FastISel is not run, this is the entire
       // block.
       bool HadTailCall;
+      ymh_log() << "Calling SelectBasicBlock #2\n";
       SelectBasicBlock(Begin, BI, HadTailCall);
 
       // But if FastISel was run, we already selected some of the block.
@@ -1615,16 +1667,28 @@ void SelectionDAGISel::SelectAllBasicBlocks(const Function &Fn) {
         FastIS->removeDeadCode(FuncInfo->InsertPt, FuncInfo->MBB->end());
     }
 
+    errs() << "\n";
+    ymh_log() << "ValueMap for the current BB#" << bb_counter << "\n";
+    for(auto reg : FuncInfo->ValueMap) {
+      ymh_log() << reg.first << " : %vreg" << TargetRegisterInfo::virtReg2Index(reg.second) << "\n";
+    }
+    errs() << "\n";
+
+    //////////////////////////// YMH_NOTE: FinishBasicBlock() -> CodeGenAndEmitDAG(): clear CurDAG
     FinishBasicBlock();
     FuncInfo->PHINodesToUpdate.clear();
     ElidedArgCopyInstrs.clear();
-  }
+
+    bb_counter++;
+  } //////////////////////////// YMH_NOTE: loop for each BasicBlock
 
   propagateSwiftErrorVRegs(FuncInfo);
 
   delete FastIS;
   SDB->clearDanglingDebugInfo();
   SDB->SPDescriptor.resetPerFunctionState();
+
+  ymh_log() << "Selection is done for " << Fn.getName() << "\n";
 }
 
 /// Given that the input MI is before a partial terminator sequence TSeq, return
@@ -1719,6 +1783,8 @@ SelectionDAGISel::FinishBasicBlock() {
           dbgs() << "Node " << i << " : ("
                  << FuncInfo->PHINodesToUpdate[i].first
                  << ", " << FuncInfo->PHINodesToUpdate[i].second << ")\n");
+
+  ymh_log() << "Inside of FinishBasicBlock()\n";
 
   // Next, now that we know what the last MBB the LLVM BB expanded is, update
   // PHI nodes in successors.

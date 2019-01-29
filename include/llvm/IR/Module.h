@@ -840,6 +840,13 @@ public:
 
   /// Take ownership of the given memory buffer.
   void setOwnedMemoryBuffer(std::unique_ptr<MemoryBuffer> MB);
+
+  Function *m_pFnSSSaveCleanV = NULL;
+  Function *m_pFnSSReadV = NULL;
+  Function *m_pFnSSSaveM = NULL;
+  Function *m_pFnSSReadM = NULL;
+  Function *m_pFnSSStart = NULL;
+  Function *m_pFnSSExit = NULL;
 };
 
 /// \brief Given "llvm.used" or "llvm.compiler.used" as a global name, collect

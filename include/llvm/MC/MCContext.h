@@ -33,6 +33,8 @@
 #include <string>
 #include <utility>
 #include <vector>
+#include "llvm/IR/Metadata.h"
+#include "llvm/IR/Function.h"
 
 namespace llvm {
 
@@ -644,6 +646,17 @@ namespace llvm {
     // FIXME: We should really do something about that.
     LLVM_ATTRIBUTE_NORETURN void reportFatalError(SMLoc L,
                                                   const Twine &Msg);
+
+  public:
+    DenseMap<const Function *, unsigned>                                    m_func2nrSSVarVRegs;       // Function -> nr(VREGs)
+    DenseMap<const Function *, DenseMap<int, unsigned>*>                    m_func2VarTag2vreg;        // Function -> tag2vreg
+    DenseMap<const Function *, DenseMap<unsigned, std::vector<unsigned>*>*> m_func2VarVReg2addedVRegs; // Function -> vreg2addedVregs
+
+    DenseMap<const Function *, unsigned>                                    m_func2nrSSArgVRegs;       // Function -> nr(VREGs)
+    DenseMap<const Function *, DenseMap<int, unsigned>*>                    m_func2ArgTag2vreg;        // Function -> tag2vreg
+    DenseMap<const Function *, DenseMap<unsigned, std::vector<unsigned>*>*> m_func2ArgVReg2addedVRegs; // Function -> vreg2addedVregs
+    DenseMap<const Function *, DenseMap<unsigned, unsigned>*>               m_func2vreg2argIdx;        // Function -> vreg2argIdx
+    DenseMap<const Function *, DenseMap<unsigned, unsigned>*>               m_func2phyreg2argIdx;      // Function -> phyreg2argIdx
   };
 
 } // end namespace llvm

@@ -316,8 +316,10 @@ private:
 
   template <typename SDNodeT, typename... ArgTypes>
   SDNodeT *newSDNode(ArgTypes &&... Args) {
-    return new (NodeAllocator.template Allocate<SDNodeT>())
-        SDNodeT(std::forward<ArgTypes>(Args)...);
+    SDNodeT *p = new (NodeAllocator.template Allocate<SDNodeT>()) SDNodeT(std::forward<ArgTypes>(Args)...);
+
+    ymh_log() << "CREATING a SDNODE for " << p->getOpcode() << "\n";
+    return p;
   }
 
   /// Build a synthetic SDNodeT with the given args and extract its subclass

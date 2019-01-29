@@ -30,6 +30,7 @@
 #include <memory>
 #include <utility>
 #include <vector>
+#include "llvm/MC/MCContext.h"
 
 namespace llvm {
 
@@ -279,6 +280,11 @@ public:
 
   /// Emit the specified function out to the OutStreamer.
   bool runOnMachineFunction(MachineFunction &MF) override {
+    if (MF.getContext().m_func2phyreg2argIdx.find(MF.getFunction()) != MF.getContext().m_func2phyreg2argIdx.end())
+      m_pPhyreg2argIdx = MF.getContext().m_func2phyreg2argIdx[MF.getFunction()];
+    else m_pPhyreg2argIdx = NULL;
+    m_clearedPhys.clear();
+
     SetupMachineFunction(MF);
     EmitFunctionBody();
     return false;
@@ -632,6 +638,45 @@ private:
   /// Emit GlobalAlias or GlobalIFunc.
   void emitGlobalIndirectSymbol(Module &M,
                                 const GlobalIndirectSymbol& GIS);
+
+public:
+  typedef enum {
+    SKIP_NONE = 0,
+    SKIP_FOLDED_RELOADED,
+    SKIP_FOLDED_SPILL,
+    SKIP_ORR,
+  } Skippable;
+
+  // copied opcodes.... :(
+  // we should not do. But, for convinence, allow me...
+  enum {
+    AARCH_OPCODE_ORRXrs = 1647,
+    AARCH_OPCODE_MOVID = 1579,
+    AARCH_OPCODE_MOVi64imm = 1603,
+  };
+
+  enum {
+    AARCH64_REG_XZR = 7,
+
+    AARCH64_REG_X9 = 208,
+    AARCH64_REG_X10 = 209,
+    AARCH64_REG_X11 = 210,
+    AARCH64_REG_X12 = 211,
+    AARCH64_REG_X13 = 212,
+    AARCH64_REG_X14 = 213,
+    AARCH64_REG_X15 = 214,
+  };
+
+  void printSSPhyRegs();
+  Skippable shouldSkip(const MachineInstr &MI);
+  bool isSSPhyReg(unsigned phyreg) {
+    return (std::find(MF->m_ssVarPhyRegs.begin(), MF->m_ssVarPhyRegs.end(), phyreg) != MF->m_ssVarPhyRegs.end() ||
+            std::find(MF->m_ssArgPhyRegs.begin(), MF->m_ssArgPhyRegs.end(), phyreg) != MF->m_ssArgPhyRegs.end());
+  }
+  void emitCommentOnSSPhys();
+
+  DenseMap<unsigned, unsigned>* m_pPhyreg2argIdx = NULL;      // phyreg2argIdx for the current function
+  std::vector<unsigned> m_clearedPhys;      // phyreg2argIdx for the current function
 };
 
 } // end namespace llvm

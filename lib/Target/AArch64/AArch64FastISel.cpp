@@ -72,6 +72,7 @@
 #include <cstdint>
 #include <iterator>
 #include <utility>
+#include <sstream>
 
 using namespace llvm;
 
@@ -142,6 +143,9 @@ class AArch64FastISel final : public FastISel {
 
     void setGlobalValue(const GlobalValue *G) { GV = G; }
     const GlobalValue *getGlobalValue() { return GV; }
+
+    int m_varTagNo = -1;
+    int m_argTagNo = -1;
   };
 
   /// Subtarget - Keep a pointer to the AArch64Subtarget around so that we can
@@ -299,7 +303,26 @@ public:
   }
 
   bool fastSelectInstruction(const Instruction *I) override;
+  void ginsengEmitAlloc(const Instruction *I/*, const unsigned vreg*/) override;
 
+  DenseMap<int, unsigned>* getVarTag2vreg(const Function *pFn);
+  bool bInVarTag2Vreg(const Function *pFn, int tagNo);
+  DenseMap<unsigned, std::vector<unsigned>*>* getVarVreg2addedVregs(const Function *pFn);
+
+  DenseMap<int, unsigned>* getArgTag2vreg(const Function *pFn);
+  bool bInArgTag2Vreg(const Function *pFn, int tagNo);
+  DenseMap<unsigned, std::vector<unsigned>*>* getArgVreg2addedVregs(const Function *pFn);
+  DenseMap<unsigned, unsigned>* getVreg2argIdx(const Function *pFn);
+
+  std::vector<const Instruction *> m_ssReadOperandInstrs;  
+
+  bool isSLibFunc(Function *pFn);
+  const CallInst *findPrevCallingSaveCleanV();
+  const CallInst *findCallInstLoadInstr(const LoadInst *pLoadInst);
+  void xcallAction4(const Instruction *I, const LoadInst *pLoadInst, unsigned resultReg);
+  void xcallAction1(const Instruction *pInstr, int argNo);
+  void xcallAction2(const CallInst *pCallingSaveCleanV, const LoadInst *pLoadInst, unsigned vregOrg,unsigned resultReg);
+  int getArgNo(const CallInst *pCallingSaveCleanV, const LoadInst *pLoadInst);
 #include "AArch64GenFastISel.inc"
 };
 
@@ -1168,6 +1191,7 @@ unsigned AArch64FastISel::emitAddSub(bool UseAdd, MVT RetVT, const Value *LHS,
           std::swap(LHS, RHS);
 
   unsigned LHSReg = getRegForValue(LHS);
+  ymh_log() << YMH_COLOR_GREEN << "%vreg" << TargetRegisterInfo::virtReg2Index(LHSReg) << YMH_COLOR_RESET << " is for Op0\n";
   if (!LHSReg)
     return 0;
   bool LHSIsKill = hasTrivialKill(LHS);
@@ -1207,6 +1231,7 @@ unsigned AArch64FastISel::emitAddSub(bool UseAdd, MVT RetVT, const Value *LHS,
                                SetFlags, WantResult);
         }
     unsigned RHSReg = getRegForValue(RHS);
+    ymh_log() << YMH_COLOR_GREEN << "%vreg" << TargetRegisterInfo::virtReg2Index(RHSReg) << YMH_COLOR_RESET << " is for Op1\n";
     if (!RHSReg)
       return 0;
     bool RHSIsKill = hasTrivialKill(RHS);
@@ -1351,6 +1376,8 @@ unsigned AArch64FastISel::emitAddSub_ri(bool UseAdd, MVT RetVT, unsigned LHSReg,
   else
     ResultReg = Is64Bit ? AArch64::XZR : AArch64::WZR;
 
+  ymh_log() << YMH_COLOR_GREEN << "%vreg" << TargetRegisterInfo::virtReg2Index(ResultReg) << YMH_COLOR_RESET << " is for Result\n";
+
   const MCInstrDesc &II = TII.get(Opc);
   LHSReg = constrainOperandRegClass(II, LHSReg, II.getNumDefs());
   BuildMI(*FuncInfo.MBB, FuncInfo.InsertPt, DbgLoc, II, ResultReg)
@@ -1437,6 +1464,8 @@ unsigned AArch64FastISel::emitAddSub_rx(bool UseAdd, MVT RetVT, unsigned LHSReg,
     ResultReg = createResultReg(RC);
   else
     ResultReg = Is64Bit ? AArch64::XZR : AArch64::WZR;
+
+  ymh_log() << YMH_COLOR_GREEN << "%vreg" << TargetRegisterInfo::virtReg2Index(ResultReg) << YMH_COLOR_RESET << " is for Result\n";
 
   const MCInstrDesc &II = TII.get(Opc);
   LHSReg = constrainOperandRegClass(II, LHSReg, II.getNumDefs());
@@ -1949,7 +1978,135 @@ bool AArch64FastISel::selectLoad(const Instruction *I) {
       cast<LoadInst>(I)->isAtomic())
     return false;
 
+
   const Value *SV = I->getOperand(0);
+  // if I load data from *SS_DATA to somewhere, we need to MOVE, not LOAD
+  int tagNo = getSSVarTagNo(I);
+  const CallInst *pCallingSaveCleanV;
+  const LoadInst *pLoadInst = dyn_cast<LoadInst>(I);
+
+  if (tagNo != -1) {
+    unsigned resultReg = createResultReg(&AArch64::GPR64spRegClass);
+    unsigned vregOrg;
+    ymh_log() << YMH_COLOR_GREEN << "%vreg" << TargetRegisterInfo::virtReg2Index(resultReg) << YMH_COLOR_RESET << "\n";
+
+    DenseMap<int, unsigned>* pTag2vreg = getVarTag2vreg(FuncInfo.Fn);
+    DenseMap<unsigned, std::vector<unsigned>*>* pVreg2vregs = getVarVreg2addedVregs(FuncInfo.Fn);
+    if (pTag2vreg->size() == 0 || pTag2vreg->find(tagNo) == pTag2vreg->end()) {  // it can be possible that load is the last instr
+      // then, we need to create SS_VREG.org here...
+      unsigned vreg = createResultReg(&AArch64::GPR64spRegClass);
+      (*pTag2vreg)[tagNo] = vreg;
+      (*pVreg2vregs)[vreg] = new std::vector<unsigned>();
+
+      ymh_log() << YMH_COLOR_BRIGHT_CYAN << "[SS_ALLOC] " << YMH_COLOR_RESET 
+                << "Creating a SS vreg " << YMH_COLOR_GREEN << "%vreg"<< TargetRegisterInfo::virtReg2Index(vreg) << YMH_COLOR_RESET 
+                << "\n";
+    }
+    vregOrg = (*pTag2vreg)[tagNo];
+
+    (*pVreg2vregs)[vregOrg]->push_back(resultReg);
+
+    ymh_log() << "[PUSH_BACK] TAG " << tagNo << " has "
+              << YMH_COLOR_GREEN << "%vreg" << TargetRegisterInfo::virtReg2Index(vregOrg) << YMH_COLOR_RESET 
+              << " pushing "
+              << YMH_COLOR_GREEN << "%vreg" << TargetRegisterInfo::virtReg2Index(resultReg) << YMH_COLOR_RESET
+              << "\n";
+    
+    // I don't want to emmit a ORR intruction for LOAD, 
+    // but for now, let me jut emit a ORR instruction
+    if (std::find(m_ssReadOperandInstrs.begin(), m_ssReadOperandInstrs.end(), I) != m_ssReadOperandInstrs.end()) {
+      LLVMContext &C = I->getContext();
+      MDNode* N2 = MDNode::get(C, MDString::get(C, std::to_string(vregOrg)));
+      ymh_log() << "N2: " << vregOrg << "\n";
+
+      BuildMI(*FuncInfo.MBB, FuncInfo.InsertPt, DbgLoc, TII.get(AArch64::MOVi64imm),
+          resultReg)
+          .addImm(SLIB_FUNC_SS_READ_IMM)
+          .addMetadata(N2);
+    } else if ( (pCallingSaveCleanV = findCallInstLoadInstr(pLoadInst)) ) { // <2> select foo()'s args'
+      xcallAction2(pCallingSaveCleanV, pLoadInst, vregOrg, resultReg);
+    } else if (m_saveClenVOP2vregOrgArgnos.find(pLoadInst) != m_saveClenVOP2vregOrgArgnos.end()) { // <4> select ss_saveCleanV()'s op2
+      xcallAction4(I, pLoadInst,resultReg);
+    } else {
+      BuildMI(*FuncInfo.MBB, FuncInfo.InsertPt, DbgLoc, TII.get(AArch64::ORRXrs),
+              resultReg)
+              .addReg(vregOrg)
+              .addReg(AArch64::XZR)
+              .addImm(0);
+      ymh_log() << YMH_COLOR_BRIGHT_CYAN << "[SS_ALLOC] " << YMH_COLOR_RESET
+                << "Emitting ORR "
+                << YMH_COLOR_GREEN << "%vreg" << TargetRegisterInfo::virtReg2Index(resultReg) << YMH_COLOR_RESET 
+                << ", " << YMH_COLOR_GREEN << "%vreg" << TargetRegisterInfo::virtReg2Index((*pTag2vreg)[tagNo]) << YMH_COLOR_RESET 
+                << ", XZR\n" ;
+    }
+
+
+
+    updateValueMap(I, resultReg);
+    return true;
+    
+  }
+
+  tagNo = getSSArgTagNo(I);
+  if (tagNo != -1) {
+    unsigned resultReg = createResultReg(&AArch64::GPR64spRegClass);
+    unsigned vregOrg;
+    ymh_log() << YMH_COLOR_GREEN << "%vreg" << TargetRegisterInfo::virtReg2Index(resultReg) << YMH_COLOR_RESET << "\n";
+
+    DenseMap<int, unsigned>* pTag2vreg = getArgTag2vreg(FuncInfo.Fn);
+    DenseMap<unsigned, std::vector<unsigned>*>* pVreg2vregs = getArgVreg2addedVregs(FuncInfo.Fn);
+    if (pTag2vreg->size() == 0 || pTag2vreg->find(tagNo) == pTag2vreg->end()) {  // it can be possible that load is the last instr
+      // then, we need to create SS_VREG.org here...
+      unsigned vreg = createResultReg(&AArch64::GPR64spRegClass);
+      (*pTag2vreg)[tagNo] = vreg;
+      (*pVreg2vregs)[vreg] = new std::vector<unsigned>();
+
+      ymh_log() << YMH_COLOR_BRIGHT_CYAN << "[SS_ALLOC] " << YMH_COLOR_RESET 
+                << "Creating a SS vreg " << YMH_COLOR_GREEN << "%vreg"<< TargetRegisterInfo::virtReg2Index(vreg) << YMH_COLOR_RESET 
+                << "\n";
+    }
+    vregOrg = (*pTag2vreg)[tagNo];
+
+    (*pVreg2vregs)[vregOrg]->push_back(resultReg);
+
+    ymh_log() << "[PUSH_BACK] TAG " << tagNo << " has "
+              << YMH_COLOR_GREEN << "%vreg" << TargetRegisterInfo::virtReg2Index(vregOrg) << YMH_COLOR_RESET 
+              << " pushing "
+              << YMH_COLOR_GREEN << "%vreg" << TargetRegisterInfo::virtReg2Index(resultReg) << YMH_COLOR_RESET
+              << "\n";
+    
+    // I don't want to emmit a ORR intruction for LOAD, 
+    // but for now, let me jut emit a ORR instruction
+    if (std::find(m_ssReadOperandInstrs.begin(), m_ssReadOperandInstrs.end(), I) != m_ssReadOperandInstrs.end()) {
+      LLVMContext &C = I->getContext();
+      MDNode* N2 = MDNode::get(C, MDString::get(C, std::to_string(vregOrg)));
+      ymh_log() << "N2: " << vregOrg << "\n";
+
+      BuildMI(*FuncInfo.MBB, FuncInfo.InsertPt, DbgLoc, TII.get(AArch64::MOVi64imm),
+          resultReg)
+          .addImm(SLIB_FUNC_SS_READ_IMM)
+          .addMetadata(N2);
+    } else if ( (pCallingSaveCleanV = findCallInstLoadInstr(pLoadInst)) ) { // <2> select foo()'s args'
+      xcallAction2(pCallingSaveCleanV, pLoadInst, vregOrg, resultReg);
+    } else if (m_saveClenVOP2vregOrgArgnos.find(pLoadInst) != m_saveClenVOP2vregOrgArgnos.end()) { // <4> select ss_saveCleanV()'s op2
+      xcallAction4(I, pLoadInst,resultReg);
+    } else {
+      BuildMI(*FuncInfo.MBB, FuncInfo.InsertPt, DbgLoc, TII.get(AArch64::ORRXrs),
+              resultReg)
+              .addReg(vregOrg)
+              .addReg(AArch64::XZR)
+              .addImm(0);
+      ymh_log() << YMH_COLOR_BRIGHT_CYAN << "[SS_ALLOC] " << YMH_COLOR_RESET
+                << "Emitting ORR "
+                << YMH_COLOR_GREEN << "%vreg" << TargetRegisterInfo::virtReg2Index(resultReg) << YMH_COLOR_RESET 
+                << ", " << YMH_COLOR_GREEN << "%vreg" << TargetRegisterInfo::virtReg2Index((*pTag2vreg)[tagNo]) << YMH_COLOR_RESET 
+                << ", XZR\n" ;
+    }
+
+    updateValueMap(I, resultReg);
+    return true;
+  }
+
   if (TLI.supportSwiftError()) {
     // Swifterror values can come from either a function parameter with
     // swifterror attribute or an alloca with swifterror attribute.
@@ -1992,6 +2149,8 @@ bool AArch64FastISel::selectLoad(const Instruction *I) {
       emitLoad(VT, RetVT, Addr, WantZExt, createMachineMemOperandFor(I));
   if (!ResultReg)
     return false;
+
+  ymh_log() << YMH_COLOR_GREEN << "%vreg" << TargetRegisterInfo::virtReg2Index(ResultReg) << YMH_COLOR_RESET << "is for Result\n";
 
   // There are a few different cases we have to handle, because the load or the
   // sign-/zero-extend might not be selected by FastISel if we fall-back to
@@ -2072,10 +2231,78 @@ bool AArch64FastISel::emitStoreRelease(MVT VT, unsigned SrcReg,
   return true;
 }
 
+void AArch64FastISel::ginsengEmitAlloc(const Instruction *I) {
+  int tagNo = getSSVarTagNo(I);
+
+  if (tagNo != -1) {
+    BuildMI(*FuncInfo.MBB, FuncInfo.InsertPt, DbgLoc, TII.get(AArch64::MOVi64imm),
+            (*getVarTag2vreg(FuncInfo.Fn))[tagNo])
+            .addImm(77);
+  
+    ymh_log() << YMH_COLOR_BRIGHT_CYAN << "[SS_ALLOC] " << YMH_COLOR_RESET
+              << "TAG (" << tagNo << ")"
+              << "Emitting MOV "
+              << YMH_COLOR_GREEN << "%vreg" << TargetRegisterInfo::virtReg2Index((*getVarTag2vreg(FuncInfo.Fn))[tagNo]) << YMH_COLOR_RESET 
+              << ", 77\n";
+  
+    ymh_log() << "MCContext in SEL "<< &MF->getContext() << "\n";
+  } else {
+    tagNo = getSSArgTagNo(I);
+    if (tagNo != -1) {
+      BuildMI(*FuncInfo.MBB, FuncInfo.InsertPt, DbgLoc, TII.get(AArch64::MOVi64imm),
+              (*getArgTag2vreg(FuncInfo.Fn))[tagNo])
+              .addImm(77);
+    
+      ymh_log() << YMH_COLOR_BRIGHT_CYAN << "[SS_ALLOC] " << YMH_COLOR_RESET
+                << "TAG (" << tagNo << ")"
+                << "Emitting MOV "
+                << YMH_COLOR_GREEN << "%vreg" << TargetRegisterInfo::virtReg2Index((*getArgTag2vreg(FuncInfo.Fn))[tagNo]) << YMH_COLOR_RESET 
+                << ", 77\n";
+    
+      ymh_log() << "MCContext in SEL "<< &MF->getContext() << "\n";
+    }
+  }
+
+  if (tagNo == -1) {
+    ymh_log() << "tagNO is -1\n";
+    exit(1);
+  }
+}
+
 bool AArch64FastISel::emitStore(MVT VT, unsigned SrcReg, Address Addr,
                                 MachineMemOperand *MMO) {
   if (!TLI.allowsMisalignedMemoryAccesses(VT))
     return false;
+
+  if (Addr.m_varTagNo != -1) {
+    BuildMI(*FuncInfo.MBB, FuncInfo.InsertPt, DbgLoc, TII.get(AArch64::ORRXrs),
+            (*getVarTag2vreg(FuncInfo.Fn))[Addr.m_varTagNo])
+            .addReg(AArch64::XZR)
+            .addReg(SrcReg)
+            .addImm(0);
+
+    ymh_log() << YMH_COLOR_BRIGHT_CYAN << "[SS_ALLOC] " << YMH_COLOR_RESET
+              << "Emitting ORR "
+              << YMH_COLOR_GREEN << "%vreg" << TargetRegisterInfo::virtReg2Index((*getVarTag2vreg(FuncInfo.Fn))[Addr.m_varTagNo]) << YMH_COLOR_RESET 
+              << ", XZR"
+              << ", " << YMH_COLOR_GREEN << "%vreg" << TargetRegisterInfo::virtReg2Index(SrcReg) << YMH_COLOR_RESET 
+              << "\n" ;
+    return true;
+  } else if (Addr.m_argTagNo != -1) {
+    BuildMI(*FuncInfo.MBB, FuncInfo.InsertPt, DbgLoc, TII.get(AArch64::ORRXrs),
+            (*getArgTag2vreg(FuncInfo.Fn))[Addr.m_argTagNo])
+            .addReg(AArch64::XZR)
+            .addReg(SrcReg)
+            .addImm(0);
+
+    ymh_log() << YMH_COLOR_BRIGHT_CYAN << "[SS_ALLOC] " << YMH_COLOR_RESET
+              << "Emitting ORR "
+              << YMH_COLOR_GREEN << "%vreg" << TargetRegisterInfo::virtReg2Index((*getArgTag2vreg(FuncInfo.Fn))[Addr.m_argTagNo]) << YMH_COLOR_RESET 
+              << ", XZR"
+              << ", " << YMH_COLOR_GREEN << "%vreg" << TargetRegisterInfo::virtReg2Index(SrcReg) << YMH_COLOR_RESET 
+              << "\n" ;
+    return true;
+  } else
 
   // Simplify this down to something we can handle.
   if (!simplifyAddress(Addr, VT))
@@ -2140,6 +2367,56 @@ bool AArch64FastISel::emitStore(MVT VT, unsigned SrcReg, Address Addr,
   return true;
 }
 
+// return tag2Vreg map
+// if doesn't exist, create one
+DenseMap<int, unsigned>* AArch64FastISel::getVarTag2vreg(const Function *pFn) {
+  if (m_func2VarTag2vreg.find(pFn) == m_func2VarTag2vreg.end())
+    m_func2VarTag2vreg[pFn] = new DenseMap<int, unsigned>();
+
+  return m_func2VarTag2vreg[pFn];
+}
+
+// return vreg2vregs map
+// if doesn't exist, create one
+DenseMap<unsigned, std::vector<unsigned>*>* AArch64FastISel::getVarVreg2addedVregs(const Function *pFn) {
+  if (m_func2VarVReg2addedVRegs.find(pFn) == m_func2VarVReg2addedVRegs.end())
+    m_func2VarVReg2addedVRegs[pFn] = new DenseMap<unsigned, std::vector<unsigned>*>();
+
+  return m_func2VarVReg2addedVRegs[pFn];
+}
+
+bool AArch64FastISel::bInVarTag2Vreg(const Function *pFn, int tagNo) {
+  DenseMap<int, unsigned>* pTag2Vreg = getVarTag2vreg(pFn);
+  return (pTag2Vreg->find(tagNo) != pTag2Vreg->end());
+}
+
+/// these are for ARG
+DenseMap<int, unsigned>* AArch64FastISel::getArgTag2vreg(const Function *pFn) {
+  if (m_func2ArgTag2vreg.find(pFn) == m_func2ArgTag2vreg.end())
+    m_func2ArgTag2vreg[pFn] = new DenseMap<int, unsigned>();
+
+  return m_func2ArgTag2vreg[pFn];
+}
+
+DenseMap<unsigned, std::vector<unsigned>*>* AArch64FastISel::getArgVreg2addedVregs(const Function *pFn) {
+  if (m_func2ArgVReg2addedVRegs.find(pFn) == m_func2ArgVReg2addedVRegs.end())
+    m_func2ArgVReg2addedVRegs[pFn] = new DenseMap<unsigned, std::vector<unsigned>*>();
+
+  return m_func2ArgVReg2addedVRegs[pFn];
+}
+
+bool AArch64FastISel::bInArgTag2Vreg(const Function *pFn, int tagNo) {
+  DenseMap<int, unsigned>* pTag2Vreg = getArgTag2vreg(pFn);
+  return (pTag2Vreg->find(tagNo) != pTag2Vreg->end());
+}
+
+DenseMap<unsigned, unsigned>* AArch64FastISel::getVreg2argIdx(const Function *pFn) {
+  if (m_func2vreg2argIdx.find(pFn) == m_func2vreg2argIdx.end())
+    m_func2vreg2argIdx[pFn] = new DenseMap<unsigned, unsigned>();
+
+  return m_func2vreg2argIdx[pFn];
+}
+
 bool AArch64FastISel::selectStore(const Instruction *I) {
   MVT VT;
   const Value *Op0 = I->getOperand(0);
@@ -2177,8 +2454,10 @@ bool AArch64FastISel::selectStore(const Instruction *I) {
     }
   }
 
-  if (!SrcReg)
+  if (!SrcReg) {
     SrcReg = getRegForValue(Op0);
+    ymh_log() << YMH_COLOR_GREEN << "%vreg" << TargetRegisterInfo::virtReg2Index(SrcReg) << YMH_COLOR_RESET << " is for Op0\n";
+  }
 
   if (!SrcReg)
     return false;
@@ -2202,8 +2481,76 @@ bool AArch64FastISel::selectStore(const Instruction *I) {
   if (!computeAddress(PtrV, Addr, Op0->getType()))
     return false;
 
+  // JUST PRINT / NOT SSDATA assign
+  // MDNode* tag = getSSAnnotation(I);
+  int tagNo = getSSVarTagNo(I);
+  if (tagNo != -1) {
+    Addr.m_varTagNo = tagNo;
+
+    // If we vreg is not allocated for the SS#, allocate one.
+    // We allocate here, becase the selection is done in a revered order.
+    // if (m_ginsengTempAllocInstr == nullptr) {
+    const Function *pFn = I->getParent()->getParent();
+    if ( !bInVarTag2Vreg(pFn, tagNo) ) {
+      unsigned vreg = createResultReg(&AArch64::GPR64spRegClass);
+
+      DenseMap<int, unsigned>* pTag2vreg = getVarTag2vreg(pFn);
+      (*pTag2vreg)[tagNo] = vreg;
+
+      DenseMap<unsigned, std::vector<unsigned>*>* pVreg2vregs = getVarVreg2addedVregs(pFn);
+      (*pVreg2vregs)[vreg] = new std::vector<unsigned>();
+      
+      if (m_func2nrSSVarVRegs.find(pFn) == m_func2nrSSVarVRegs.end()) m_func2nrSSVarVRegs[pFn] = 1;
+      else m_func2nrSSVarVRegs[pFn]++;
+      ymh_log() << pFn->getName() << "(" << pFn << ") has " << m_func2nrSSVarVRegs[pFn] << " tagged regs\n";
+
+      ymh_log() << YMH_COLOR_BRIGHT_CYAN << "[SS_ALLOC] " << YMH_COLOR_RESET 
+                << "Creating a SS vreg " << YMH_COLOR_GREEN << "%vreg"<< TargetRegisterInfo::virtReg2Index(vreg) << YMH_COLOR_RESET 
+                << "\n";
+    }
+
+  }
+
+  tagNo = getSSArgTagNo(I);
+  if (tagNo != -1) {
+    Addr.m_argTagNo = tagNo;
+
+    // If vreg is not allocated for the SS#, allocate one.
+    // We allocate here, becase the selection is done in a revered order.
+    const Function *pFn = I->getParent()->getParent();
+    if ( !bInArgTag2Vreg(pFn, tagNo) ) {
+      unsigned vreg = createResultReg(&AArch64::GPR64spRegClass);
+
+      DenseMap<int, unsigned>* pTag2vreg = getArgTag2vreg(pFn);
+      (*pTag2vreg)[tagNo] = vreg;
+
+      DenseMap<unsigned, std::vector<unsigned>*>* pVreg2vregs = getArgVreg2addedVregs(pFn);
+      (*pVreg2vregs)[vreg] = new std::vector<unsigned>();
+      
+      if (m_func2nrSSArgVRegs.find(pFn) == m_func2nrSSArgVRegs.end()) m_func2nrSSArgVRegs[pFn] = 1;
+      else m_func2nrSSArgVRegs[pFn]++;
+      ymh_log() << pFn->getName() << "(" << pFn << ") has " << m_func2nrSSArgVRegs[pFn] << " tagged regs\n";
+
+      ymh_log() << YMH_COLOR_BRIGHT_CYAN << "[SS_ALLOC] " << YMH_COLOR_RESET 
+                << "Creating a SS vreg " << YMH_COLOR_GREEN << "%vreg"<< TargetRegisterInfo::virtReg2Index(vreg) << YMH_COLOR_RESET 
+                << "\n";
+    }
+
+    // for arg idx
+    const Argument *pArg = dyn_cast<Argument>(Op0);
+    if (pArg) {
+      DenseMap<unsigned, unsigned>* pVreg2argIdx = getVreg2argIdx(pFn);
+      unsigned vreg = (*getArgTag2vreg(pFn))[tagNo];
+      (*pVreg2argIdx)[vreg] = pArg->getArgNo();
+      ymh_log() << "FINDING ARGIDX: " << YMH_COLOR_GREEN << "%vreg"
+                << TargetRegisterInfo::virtReg2Index(vreg) << YMH_COLOR_RESET
+                << " is for arg_" << (*pVreg2argIdx)[vreg] << "\n";
+    }
+  }
+
   if (!emitStore(VT, SrcReg, Addr, createMachineMemOperandFor(I)))
     return false;
+
   return true;
 }
 
@@ -3013,6 +3360,135 @@ bool AArch64FastISel::fastLowerArguments() {
   return true;
 }
 
+const CallInst *AArch64FastISel::findCallInstLoadInstr(const LoadInst *pLoadInst) {
+  /*for (auto pair : m_callingSaveCleanV2LoadInstrs){
+    for (auto _pLoadInst : m_callingSaveCleanV2LoadInstrs[pair.first]) {
+      if (pLoadInst == _pLoadInst) return pair.first;
+    }
+  }*/
+
+  for (auto pair : m_callingSaveCleanV2LoadInstrArgnos){
+    for (auto pLoadArgno : m_callingSaveCleanV2LoadInstrArgnos[pair.first]) {
+      if (pLoadInst == pLoadArgno.first) return pair.first;
+    }
+  }
+
+  return nullptr;
+}
+
+void AArch64FastISel::xcallAction4(const Instruction *I, const LoadInst *pLoadInst, unsigned resultReg) {
+  LLVMContext &C = I->getContext();
+  std::stringstream _vregOrgArgnos;
+  // std::string vregOrgs;
+
+  for(auto it = m_saveClenVOP2vregOrgArgnos[pLoadInst].begin(); it != m_saveClenVOP2vregOrgArgnos[pLoadInst].end(); it++) {
+    std::pair<unsigned, unsigned> vregOrgArgno = *it;
+
+    _vregOrgArgnos << std::to_string(vregOrgArgno.first) << "_" << std::to_string(vregOrgArgno.second);
+    if (std::next(it) == m_saveClenVOP2vregOrgArgnos[pLoadInst].end()) break;
+    _vregOrgArgnos << "_";
+  }
+
+  ymh_log() << "XCALL: pushing<4> attaching \"" << _vregOrgArgnos.str() << "\" to MI\n";
+  MDNode* N2 = MDNode::get(C, MDString::get(C, _vregOrgArgnos.str()));
+
+  ymh_log() << "[CFI_BLR] instr " << *I << "\n";
+  BuildMI(*FuncInfo.MBB, FuncInfo.InsertPt, DbgLoc, TII.get(AArch64::MOVi64imm),
+      resultReg)
+      .addImm(SLIB_FUNC_SS_SAVE_CLEAN_V_IMM)
+      .addMetadata(N2);
+}
+
+/*
+ * called by processCallArgs()
+ * call -> (load, argNo)
+ */
+void AArch64FastISel::xcallAction1(const Instruction *pInstr, int argNo) {
+  const LoadInst *pLoadInst = dyn_cast<LoadInst>(pInstr);
+  if (!pLoadInst) {pInstr->print(ymh_log()); errs() << " is not a LoadInstr!!!\n"; exit(1);}
+
+  const CallInst *pCallingSaveCleanV = findPrevCallingSaveCleanV();
+  if (!pCallingSaveCleanV) { 
+    ymh_log() << " cannot find calling " << SLIB_FUNC_SS_SAVE_CLEAN_V << "() from "; 
+    m_pCurInstr->print(errs()); 
+    errs() << "\n"; 
+    exit(1);
+  }
+
+  // m_callingSaveCleanV2LoadInstrs[pCallingSaveCleanV].push_back(pLoadInst);
+  m_callingSaveCleanV2LoadInstrArgnos[pCallingSaveCleanV].push_back(std::make_pair(pLoadInst, argNo));
+
+  pLoadInst->print(ymh_log() << "XCALL: pushing<1> " << YMH_COLOR_BRIGHT_BLACK);
+  pCallingSaveCleanV->print(errs() << YMH_COLOR_RESET << ": " <<  argNo << " into " << YMH_COLOR_BRIGHT_BLACK);
+  errs() << "\n";
+}
+
+int AArch64FastISel::getArgNo(const CallInst *pCallingSaveCleanV, const LoadInst *pLoadInst) {
+  for (auto instArg: m_callingSaveCleanV2LoadInstrArgnos[pCallingSaveCleanV]) {
+    if (instArg.first == pLoadInst) return instArg.second;
+  }
+
+  ymh_log() << "Oh no... cannot find loadInstr from m_callingSaveCleanV2LoadInstrArgnos\n";
+  exit(1);
+  return -1;
+}
+
+/*
+ * called by selectLoad()
+ * add XOR instr for vreg
+ */
+// selection foo()'s arg
+void AArch64FastISel::xcallAction2(const CallInst *pCallingSaveCleanV, 
+                                  const LoadInst *pLoadInst, 
+                                  unsigned vregOrg,
+                                  unsigned resultReg) {
+  int argNo = getArgNo(pCallingSaveCleanV, pLoadInst);
+  m_callingSaveCleanV2vregOrgArgnos[pCallingSaveCleanV].push_back(std::make_pair(vregOrg, argNo));
+  ymh_log() << "XCALL: pushing<2> [" << YMH_COLOR_GREEN << "%vreg" << TargetRegisterInfo::virtReg2Index(vregOrg)
+            << YMH_COLOR_RESET << " : "
+            << argNo;
+  pCallingSaveCleanV->print(errs() << "] into " << YMH_COLOR_BRIGHT_BLACK);
+  errs() << YMH_COLOR_RESET << "\n";
+  
+  BuildMI(*FuncInfo.MBB, FuncInfo.InsertPt, DbgLoc, TII.get(AArch64::ORRXrs),
+          resultReg)
+          .addReg(resultReg)
+          .addReg(AArch64::XZR)
+          .addImm(0);
+
+  ymh_log() << "XCALL: Emitting ORR "
+            << YMH_COLOR_GREEN << "%vreg" << TargetRegisterInfo::virtReg2Index(resultReg) << YMH_COLOR_RESET 
+            << ", " << YMH_COLOR_GREEN << "%vreg" << TargetRegisterInfo::virtReg2Index(resultReg) << YMH_COLOR_RESET 
+            << ", XZR\n" ;
+}
+
+const CallInst *AArch64FastISel::findPrevCallingSaveCleanV() {
+  BasicBlock::const_iterator it = m_curBI;
+  it--;
+  while(it != m_pCurBB->begin()) {
+    const CallInst *pCallInstr = dyn_cast<CallInst>(it);
+
+    if (pCallInstr &&
+        !pCallInstr->getCalledFunction()->getName().compare(SLIB_FUNC_SS_SAVE_CLEAN_V)) 
+      return pCallInstr;
+
+    it--;
+  }
+
+  return nullptr;
+}
+
+bool AArch64FastISel::isSLibFunc(Function *pFn) {
+  std::string fnName = pFn->getName().str();
+  if (!fnName.compare(SLIB_FUNC_SS_READ) ||
+      !fnName.compare(SLIB_FUNC_SS_WRITE) ||
+      !fnName.compare(SLIB_FUNC_SS_SAVE_CLEAN_V) ||
+      !fnName.compare(SLIB_FUNC_SS_READ_V)
+    ) return true;
+
+  return false;
+}
+
 bool AArch64FastISel::processCallArgs(CallLoweringInfo &CLI,
                                       SmallVectorImpl<MVT> &OutVTs,
                                       unsigned &NumBytes) {
@@ -3028,6 +3504,16 @@ bool AArch64FastISel::processCallArgs(CallLoweringInfo &CLI,
   unsigned AdjStackDown = TII.getCallFrameSetupOpcode();
   BuildMI(*FuncInfo.MBB, FuncInfo.InsertPt, DbgLoc, TII.get(AdjStackDown))
     .addImm(NumBytes).addImm(0);
+  
+  const CallInst *pCallInstr = dyn_cast<CallInst>(m_pCurInstr);
+  Function *pCallee = pCallInstr->getCalledFunction();
+  if (pCallee == nullptr) {
+    pCallInstr->print(ymh_log() << "Calling an undefined func by" << YMH_COLOR_BRIGHT_BLACK);
+    errs() << YMH_COLOR_RESET << "\n";
+  }
+  if (pCallee && !isSLibFunc(pCallee)) {
+    ymh_log() << "XCALL_TOP: "<< pCallInstr->getParent()->getParent()->getName() << "() -calling-> " << pCallee->getName() <<"\n";
+  }
 
   // Process the args.
   for (CCValAssign &VA : ArgLocs) {
@@ -3035,14 +3521,139 @@ bool AArch64FastISel::processCallArgs(CallLoweringInfo &CLI,
     MVT ArgVT = OutVTs[VA.getValNo()];
 
     unsigned ArgReg = getRegForValue(ArgVal);
+    bool dontCopy = false;
+    if (pCallee) {
+      ymh_log() << "Handling " <<pCallee->getName() << "()'s " << VA.getValNo() << "th arg\n";
+      const Instruction *pInstr = dyn_cast<Instruction>(ArgVal);
+      ymh_log() << pInstr << " " << *pCallInstr << " foo?(" << !isSLibFunc(pCallee) << ")\n";
+      if (pInstr && pCallInstr && 
+        (!pCallee->getName().str().compare(SLIB_FUNC_SS_READ) || !pCallee->getName().str().compare(SLIB_FUNC_SS_WRITE))
+        ) {
+        ymh_log() << pCallee->getName().str() << "() READ or WRITE\n"; //"SLIB_FUNC_SS_READ\n";
+        ymh_log() << YMH_COLOR_BRIGHT_BLACK << pCallee->getName() << YMH_COLOR_RESET 
+                  << " has ";
+        pInstr->print(errs() << YMH_COLOR_BRIGHT_BLACK);
+        errs() << YMH_COLOR_RESET << "\n";
+
+        // let me select the instruction ahead
+        // No... I cannot decide phy addr at this moment...
+        // maybe I can. I can also add MD to MachineInstr!
+        // let me try!
+        // I have no problem so far... but we should not do.
+        // 
+        // CHAGE THE PLAN!
+        // 1. HERE: Let's mark it (pushing to m_ssReadOperandInstrs)
+        // 2. selectLoad(): Emit a fake movi MachineInstr when loading an arg 
+        //                  *AND* add metadata telling VREG.org
+        // 3. RegAlloc: change the imm to the phyreg number.
+        int tagNo = getSSVarTagNo(pInstr);
+        if (tagNo != -1) {
+          m_ssReadOperandInstrs.push_back(pInstr);
+        } else {
+          tagNo = getSSArgTagNo(pInstr);
+          if (tagNo != -1) {
+            m_ssReadOperandInstrs.push_back(pInstr);
+          }
+        }
+
+        if (tagNo == -1 && VA.getValNo() > 1) {
+          ymh_log() << "Looks like you pass non slong to slong...\n"
+                    << "Check your code!\n";
+          exit(1);
+        }
+
+      } else if (pInstr && pCallInstr && !isSLibFunc(pCallee)) { // <1> select foo()
+        ///////////////////////////////////////////////// ignore this ///////////////////
+        //    %key.added = load %key.org
+        //    Selecting foo(i, key, j) <-- key: ss_arg
+        // 1. HERE:  
+        //      - Mark SS_ARGs (pusing %key.added to m_ssFoo2ssArgs)
+        // 2. selectLoad(): %key.added = load %key.org
+        //      - Emit a fake movi instr
+        //      - Add to MI metadata telling VREG.org
+        //      - link the MI to the prev Instr (calling ss_readCleanV()) 
+        //            (pushing to m_ssReadCleanV2MIArgs; key: prev Instr; val: [vreg.org])
+        // 3. Handover ss_readCleanV
+        ////////////////////////////////////////////////////////////////////////////////
+
+        int tagNo = getSSVarTagNo(pInstr);
+        if (tagNo != -1) {
+          ymh_log() << "Action1 for VAR\n";
+          xcallAction1(pInstr, VA.getValNo());
+          dontCopy = true;
+        } else {
+          tagNo = getSSArgTagNo(pInstr);
+          if (tagNo != -1) {
+            ymh_log() << "Action1 for ARG\n";
+            xcallAction1(pInstr, VA.getValNo());
+            dontCopy = true;
+          }
+        }
+
+      } else if (VA.getValNo() == SLIB_FUNC_SS_SAVE_CLEAN_V_ENCODE_ARGIDX && 
+                  pCallInstr && 
+                  !pCallee->getName().str().compare(SLIB_FUNC_SS_SAVE_CLEAN_V)) { // <3> select ss_saveCleanV()
+        // MUST: double check pInstr is nullptr. 
+        // Otherwise, I need to change the above condition code
+
+        ///////////////////////////////////////////////// ignore this ///////////////////
+        //    %anySS.added = load %addSS.org
+        //    Selecting ss_readCleanV(#, #, anySS) <-- anySS is only to use selectLoad()
+        // 1. HERE: 
+        //      - investigate m_ssReadCleanV2MIArgs to check related vregs
+        //      - pushing the vregs to m_ssReadCleanVOP2vregs (key: %anySS.added, vregs: vregs)
+        // 2. selectLoad(): %anySS.added = load %addSS.org
+        //      - Emit a fake movi instr
+        //      - Add to MI metadata telling the list of VREG.org
+        //      - link the MI to 
+        ////////////////////////////////////////////////////////////////////////////////
+
+        m_saveClenVOP2vregOrgArgnos[pInstr] = m_callingSaveCleanV2vregOrgArgnos[pCallInstr];
+        ymh_log() << "XCALL: pushing<3> ";
+        for(auto vregArg : m_saveClenVOP2vregOrgArgnos[pInstr]) {
+          errs()  << "[" << YMH_COLOR_GREEN << "%vreg" << TargetRegisterInfo::virtReg2Index(vregArg.first) 
+                  << YMH_COLOR_RESET << " : "
+                  << vregArg.second << "] ";
+        }
+        errs() << "\n";
+      }
+    } else {
+      // function pointer!
+      ymh_log() << "XCALL_FP: Calling a function pointer with " << ArgLocs.size() << " args\n";
+      ymh_log() << "Handling a function pointer's " << VA.getValNo() << "th arg\n";
+      ymh_log() << "Instr: " << *m_pCurInstr << "\n";
+      const Instruction *pInstr = dyn_cast<Instruction>(ArgVal);
+
+      if (pInstr && pCallInstr) {
+        int tagNo = getSSVarTagNo(pInstr);
+        if (tagNo != -1) {
+          ymh_log() << "Action1 for VAR\n";
+          xcallAction1(pInstr, VA.getValNo());
+          dontCopy = true;
+        } else {
+          tagNo = getSSArgTagNo(pInstr);
+          if (tagNo != -1) {
+            ymh_log() << "Action1 for ARG\n";
+            xcallAction1(pInstr, VA.getValNo());
+            dontCopy = true;
+          }
+        }
+      } else {
+        ymh_log() << "What else do we expect????\n";
+        exit(1);
+      }
+    }
+
     if (!ArgReg)
       return false;
 
     // Handle arg promotion: SExt, ZExt, AExt.
     switch (VA.getLocInfo()) {
     case CCValAssign::Full:
+      ymh_log() << "VA.getLocInfo() CCValAssign::Full\n";
       break;
     case CCValAssign::SExt: {
+        ymh_log() << "VA.getLocInfo() CCValAssign::SExt\n";
       MVT DestVT = VA.getLocVT();
       MVT SrcVT = ArgVT;
       ArgReg = emitIntExt(SrcVT, ArgReg, DestVT, /*isZExt=*/false);
@@ -3051,8 +3662,10 @@ bool AArch64FastISel::processCallArgs(CallLoweringInfo &CLI,
       break;
     }
     case CCValAssign::AExt:
+      ymh_log() << "VA.getLocInfo() CCValAssign::AExt\n";
     // Intentional fall-through.
     case CCValAssign::ZExt: {
+        ymh_log() << "VA.getLocInfo() CCValAssign::ZExt\n";
       MVT DestVT = VA.getLocVT();
       MVT SrcVT = ArgVT;
       ArgReg = emitIntExt(SrcVT, ArgReg, DestVT, /*isZExt=*/true);
@@ -3066,9 +3679,11 @@ bool AArch64FastISel::processCallArgs(CallLoweringInfo &CLI,
 
     // Now copy/store arg to correct locations.
     if (VA.isRegLoc() && !VA.needsCustom()) {
+      if (!dontCopy) {
       BuildMI(*FuncInfo.MBB, FuncInfo.InsertPt, DbgLoc,
-              TII.get(TargetOpcode::COPY), VA.getLocReg()).addReg(ArgReg);
-      CLI.OutRegs.push_back(VA.getLocReg());
+              TII.get(TargetOpcode::COPY), VA.getLocReg()).addReg(ArgReg).print("[CFI_BLR] ");
+            CLI.OutRegs.push_back(VA.getLocReg());
+      }
     } else if (VA.needsCustom()) {
       // FIXME: Handle custom args.
       return false;
@@ -3202,10 +3817,12 @@ bool AArch64FastISel::fastLowerCall(CallLoweringInfo &CLI) {
   if (Callee && !computeCallAddress(Callee, Addr))
     return false;
 
+  ymh_log() << "handling args\n";
   // Handle the arguments now that we've gotten them.
   unsigned NumBytes;
   if (!processCallArgs(CLI, OutVTs, NumBytes))
     return false;
+  ymh_log() << "args handled\n";
 
   // Issue the call.
   MachineInstrBuilder MIB;
@@ -5059,6 +5676,10 @@ bool AArch64FastISel::selectAtomicCmpXchg(const AtomicCmpXchgInst *I) {
 }
 
 bool AArch64FastISel::fastSelectInstruction(const Instruction *I) {
+  if (getSSVarTagNo(I) != -1) {
+    ymh_log() << YMH_COLOR_RED << "# SS_DATA Found => select*() should check" << YMH_COLOR_RESET << "\n";
+  }
+
   switch (I->getOpcode()) {
   default:
     break;

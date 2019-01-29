@@ -755,6 +755,16 @@ try_next:;
   return FilterID;
 }
 
+bool MachineFunction::isSSPhyReg(unsigned phyReg) const {
+  std::vector<unsigned> allPhyRegs = m_ssVarPhyRegs;
+  allPhyRegs.insert(allPhyRegs.begin(), m_ssArgPhyRegs.begin(), m_ssArgPhyRegs.end());
+  for(unsigned _phyReg: allPhyRegs) {
+    if (_phyReg == phyReg) return true;
+  }
+
+  return false;
+}
+
 void llvm::addLandingPadInfo(const LandingPadInst &I, MachineBasicBlock &MBB) {
   MachineFunction &MF = *MBB.getParent();
   if (const auto *PF = dyn_cast<Function>(

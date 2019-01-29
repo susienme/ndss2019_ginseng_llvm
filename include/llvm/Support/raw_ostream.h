@@ -23,6 +23,24 @@
 #include <string>
 #include <system_error>
 
+#define YMH_COLOR_BLACK           "\x1b[30m"
+#define YMH_COLOR_RED             "\x1b[31m"
+#define YMH_COLOR_GREEN           "\x1b[32m"
+#define YMH_COLOR_YELLOW          "\x1b[33m"
+#define YMH_COLOR_BLUE            "\x1b[34m"
+#define YMH_COLOR_MAGENTA         "\x1b[35m"
+#define YMH_COLOR_CYAN            "\x1b[36m"
+#define YMH_COLOR_WHITE           "\x1b[37m"
+#define YMH_COLOR_BRIGHT_BLACK    "\x1b[1;30m"
+#define YMH_COLOR_BRIGHT_RED      "\x1b[1;31m"
+#define YMH_COLOR_BRIGHT_GREEN    "\x1b[1;32m"
+#define YMH_COLOR_BRIGHT_YELLOW   "\x1b[1;33m"
+#define YMH_COLOR_BRIGHT_BLUE     "\x1b[1;34m"
+#define YMH_COLOR_BRIGHT_MAGENTA  "\x1b[1;35m"
+#define YMH_COLOR_BRIGHT_CYAN     "\x1b[1;36m"
+#define YMH_COLOR_BRIGHT_WHITE    "\x1b[1;37m"
+#define YMH_COLOR_RESET           "\x1b[0m"
+
 namespace llvm {
 
 class formatv_object_base;
@@ -449,6 +467,11 @@ raw_ostream &outs();
 /// This returns a reference to a raw_ostream for standard error. Use it like:
 /// errs() << "foo" << "bar";
 raw_ostream &errs();
+
+raw_ostream &ymh_log();
+void ymh_printStack();
+bool ginsengIsSSDATA(unsigned vreg, bool bPrintErr);
+void ginsengSetSSDATA(unsigned vreg);
 
 /// This returns a reference to a raw_ostream which simply discards output.
 raw_ostream &nulls();

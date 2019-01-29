@@ -72,6 +72,8 @@ public:
 private:
   bool shouldCombineCSRLocalStackBump(MachineFunction &MF,
                                       unsigned StackBumpBytes) const;
+
+  bool getUUID(unsigned long *pTop, unsigned long *pBottom) const;
 };
 
 } // End llvm namespace

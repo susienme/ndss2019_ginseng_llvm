@@ -139,6 +139,8 @@ private:
   using MInstToMCSymbol = std::map<const MachineInstr *, MCSymbol *>;
 
   MInstToMCSymbol LOHInstToLabel;
+
+  bool forSSArgMov(unsigned dest, unsigned src);
 };
 
 } // end anonymous namespace
@@ -667,10 +669,70 @@ void AArch64AsmPrinter::EmitInstruction(const MachineInstr *MI) {
     return;
   }
 
+
   // Finally, do the automated lowerings for everything else.
   MCInst TmpInst;
   MCInstLowering.Lower(MI, TmpInst);
-  EmitToStreamer(*OutStreamer, TmpInst);
+  if (MI->getOpcode() != AArch64::LDURXi || 
+      !MF->isSSPhyReg(MI->getOperand(0).getReg())) {
+    MI->print(ymh_log() << "in " << MF->getFunction()->getName() << "(): ");
+    EmitToStreamer(*OutStreamer, TmpInst);
+  }
+  if (MI->getOpcode() == AArch64::ORRXrs) {
+    ymh_log() << "in " << MF->getFunction()->getName() << "()\n";
+    MI->print(ymh_log() << "DO AUTOMATED LOWERING: ");
+    ymh_log() << "MI  OP: " << MI->getOpcode() << "\n";
+
+    TmpInst.print(ymh_log() << "DO AUTOMATED LOWERING: ");
+    errs() << "\n";
+    ymh_log() << "MCI OP: " << TmpInst.getOpcode() << "\n";
+
+    // if dest is SS_ARG && src is arg_# -> clean!
+    const MachineOperand *op0, *op1, *op2, *op3;
+    op0 = &MI->getOperand(0);
+    op1 = &MI->getOperand(1);
+    op2 = &MI->getOperand(2);
+    op3 = &MI->getOperand(3);
+    
+    if (op0->isReg() && op1->isReg() && op2->isReg() && op3->isImm() && op3->getImm() == 0) {
+      if ( op1->getReg() == AARCH64_REG_XZR ) {
+        if (op2->getReg() != AArch64::XZR && forSSArgMov(op0->getReg(), op2->getReg()) ) {
+
+          if ( std::find(m_clearedPhys.begin(), m_clearedPhys.end(), op0->getReg()) == m_clearedPhys.end() ) {
+            // clear OP2
+            MCInst clearMCInst;
+            clearMCInst.setOpcode(AArch64::ORRXrs);
+            clearMCInst.addOperand(TmpInst.getOperand(2) /**op2*/);
+            clearMCInst.addOperand(TmpInst.getOperand(1) /**op1*/);
+            clearMCInst.addOperand(TmpInst.getOperand(1) /**op1*/);
+            clearMCInst.addOperand(TmpInst.getOperand(3) /**op3*/);
+            clearMCInst.print(ymh_log() << "CLEAR INSTR: ");
+            errs() << "\n";
+            OutStreamer->GetCommentOS() << "YMH: Clearing CMD\n";
+            EmitToStreamer(*OutStreamer, clearMCInst);
+            
+            m_clearedPhys.push_back(op0->getReg());
+          }
+          
+        }
+      } else if ( op2->getReg() == AARCH64_REG_XZR ) {
+        ymh_log() << "CHECK #2\n";
+        if (op1->getReg() != AArch64::XZR && forSSArgMov(op0->getReg(), op1->getReg()) ) {
+        }
+      }
+    }
+  }
+}
+
+
+bool AArch64AsmPrinter::forSSArgMov(unsigned dest, unsigned src) {
+  const TargetRegisterInfo *TRI = MF->getSubtarget().getRegisterInfo();
+  if (src == AArch64::LR) return false;
+  if (!m_pPhyreg2argIdx) return false;
+  if (m_pPhyreg2argIdx->find(dest) == m_pPhyreg2argIdx->end()) return false;
+  if ((*m_pPhyreg2argIdx)[dest] == (unsigned int) std::stoi(std::string(TRI->getName(src)).substr(1))) return true;
+
+  return false;
 }
 
 // Force static initialization.

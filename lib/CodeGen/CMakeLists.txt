@@ -152,6 +152,8 @@ add_llvm_library(LLVMCodeGen
   VirtRegMap.cpp
   WinEHPrepare.cpp
   XRayInstrumentation.cpp
+  RegAllocGinsengFast.cpp
+  ss_section_support.cpp 
 
   ADDITIONAL_HEADER_DIRS
   ${LLVM_MAIN_INCLUDE_DIR}/llvm/CodeGen
@@ -167,3 +169,4 @@ add_subdirectory(SelectionDAG)
 add_subdirectory(AsmPrinter)
 add_subdirectory(MIRParser)
 add_subdirectory(GlobalISel)
+add_definitions(-DUUIDGEN_PATH=\"${LLVM_MAIN_SRC_DIR}/uuid/uuidgen.py\")

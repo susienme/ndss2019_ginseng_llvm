@@ -813,7 +813,9 @@ void TargetPassConfig::addMachinePasses() {
     addOptimizedRegAlloc(createRegAllocPass(true));
   else {
     if (RegAlloc != &useDefaultRegisterAllocator &&
-        RegAlloc != &createFastRegisterAllocator)
+        RegAlloc != &createFastRegisterAllocator
+        && RegAlloc != &createGinsengFastRegisterAllocator
+        )
       report_fatal_error("Must use fast (default) register allocator for unoptimized regalloc.");
     addFastRegAlloc(createRegAllocPass(false));
   }

@@ -2710,6 +2710,8 @@ void llvm::emitFrameOffset(MachineBasicBlock &MBB,
     }
     assert((ThisVal >> ShiftSize) <= MaxEncoding &&
            "Encoding cannot handle value that big");
+    ymh_log() << "[PROLOGUE] emitFrameOffset#1 offset(" << (ThisVal >> ShiftSize) << ")\n";
+
     BuildMI(MBB, MBBI, DL, TII->get(Opc), DestReg)
         .addReg(SrcReg)
         .addImm(ThisVal >> ShiftSize)
@@ -2721,11 +2723,13 @@ void llvm::emitFrameOffset(MachineBasicBlock &MBB,
     if (Offset == 0)
       return;
   }
+  ymh_log() << "[PROLOGUE] emitFrameOffset#2 offset(" << Offset << ")\n";
   BuildMI(MBB, MBBI, DL, TII->get(Opc), DestReg)
       .addReg(SrcReg)
       .addImm(Offset)
       .addImm(AArch64_AM::getShifterImm(AArch64_AM::LSL, 0))
-      .setMIFlag(Flag);
+      .setMIFlag(Flag); //.print();
+
 }
 
 MachineInstr *AArch64InstrInfo::foldMemoryOperandImpl(

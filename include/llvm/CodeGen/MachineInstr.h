@@ -1314,6 +1314,9 @@ private:
   const TargetRegisterClass *getRegClassConstraintEffectForVRegImpl(
       unsigned OpIdx, unsigned Reg, const TargetRegisterClass *CurRC,
       const TargetInstrInfo *TII, const TargetRegisterInfo *TRI) const;
+
+public:
+  int m_varTagNo = -1;
 };
 
 /// Special DenseMapInfo traits to compare MachineInstr* by *value* of the

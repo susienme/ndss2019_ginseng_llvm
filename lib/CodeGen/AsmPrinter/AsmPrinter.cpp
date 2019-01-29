@@ -679,7 +679,8 @@ void AsmPrinter::EmitFunctionHeader() {
   // Emit the CurrentFnSym.  This is a virtual function to allow targets to
   // do their wild and crazy things as required.
   EmitFunctionEntryLabel();
-
+  emitCommentOnSSPhys();
+  
   // If the function had address-taken blocks that got deleted, then we have
   // references to the dangling symbols.  Emit them at the start of the function
   // so that we don't get references to undefined symbols.
@@ -709,8 +710,10 @@ void AsmPrinter::EmitFunctionHeader() {
   }
 
   // Emit the prologue data.
-  if (F->hasPrologueData())
+  if (F->hasPrologueData()) {
+    ymh_log() << F->getName() << " has PROLOGUE\n";
     EmitGlobalConstant(F->getParent()->getDataLayout(), F->getPrologueData());
+  }
 }
 
 /// EmitFunctionEntryLabel - Emit the label that is the entrypoint for the
@@ -966,6 +969,91 @@ static bool needFuncLabelsForEHOrDebugInfo(const MachineFunction &MF,
       classifyEHPersonality(MF.getFunction()->getPersonalityFn()));
 }
 
+AsmPrinter::Skippable AsmPrinter::shouldSkip(const MachineInstr &MI) {
+  const MachineFunction *MF = MI.getParent()->getParent();
+  const TargetInstrInfo *TII = MF->getSubtarget().getInstrInfo();
+  const MachineFrameInfo &MFI = MF->getFrameInfo();
+  int FI;
+  const MachineMemOperand *MMO;
+
+  if (TII->hasLoadFromStackSlot(MI, MMO, FI) &&
+      MFI.isSpillSlotObjectIndex(FI) &&
+      isSSPhyReg(MI.getOperand(0).getReg())) return SKIP_FOLDED_RELOADED;
+  
+
+  if (TII->hasStoreToStackSlot(MI, MMO, FI) &&
+      MFI.isSpillSlotObjectIndex(FI) &&
+      isSSPhyReg(MI.getOperand(0).getReg())) return SKIP_FOLDED_SPILL;
+
+  // if instr. is added by Ginseng for compatability, skip it.
+  const MachineOperand *op0, *op1, *op2, *op3;
+  switch(MI.getOpcode()) {
+  case AARCH_OPCODE_ORRXrs:
+    op0 = &MI.getOperand(0);
+    op1 = &MI.getOperand(1);
+    op2 = &MI.getOperand(2);
+    op3 = &MI.getOperand(3);
+    // conditions: 
+    // op1 or op2 must br xzr
+    // op0 must be same as op1 or op2, which is not xzr
+    // op3(imm) must be 0
+    if (op3->isImm() && op3->getImm() == 0) {
+      if (  (op1->isReg() && op1->getReg() == AARCH64_REG_XZR) &&
+            (op0->getReg() == op2->getReg()) ) return SKIP_ORR;
+      else if ( (op2->isReg() && op2->getReg() == AARCH64_REG_XZR) &&
+                  (op0->getReg() == op1->getReg()) )return SKIP_ORR;
+    }
+    break;
+  }
+
+  return SKIP_NONE;
+}
+
+void AsmPrinter::printSSPhyRegs() {
+  const TargetRegisterInfo *TRI = MF->getSubtarget().getRegisterInfo();
+
+  ymh_log() << MF->getName() << "(" << MF << ") has " 
+            << MF->m_ssVarPhyRegs.size() << " SS_PHY_REGS\n"
+            << YMH_COLOR_RED;
+  for (unsigned phyreg : MF->m_ssVarPhyRegs) 
+    errs() << TRI->getName(phyreg) << " ";
+  errs() << YMH_COLOR_RESET << " for Var\n";
+
+  ymh_log() << MF->getName() << "(" << MF << ") has " 
+            << MF->m_ssArgPhyRegs.size() << " SS_PHY_REGS\n"
+            << YMH_COLOR_RED;
+  for (unsigned phyreg : MF->m_ssArgPhyRegs) 
+    errs() << TRI->getName(phyreg) << " ";
+  errs() << YMH_COLOR_RESET << " for Arg\n";
+}
+
+void AsmPrinter::emitCommentOnSSPhys() {
+  const TargetRegisterInfo *TRI = MF->getSubtarget().getRegisterInfo();
+  
+  SmallString<128> Str_var;
+  raw_svector_ostream OS_var(Str_var);
+
+  OS_var << " YMH: SS_VAR: ";
+  for (unsigned phyreg : MF->m_ssVarPhyRegs) {
+    std::string lowerCasePhyName = TRI->getName(phyreg); 
+    std::transform(lowerCasePhyName.begin(), lowerCasePhyName.end(), lowerCasePhyName.begin(), ::tolower);
+
+    OS_var << lowerCasePhyName << " ";
+  }
+  OutStreamer->emitRawComment(OS_var.str(), false);
+
+  SmallString<128> Str_arg;
+  raw_svector_ostream OS_arg(Str_arg);
+
+  OS_arg << " YMH: SS_ARG: ";
+  for (unsigned phyreg : MF->m_ssArgPhyRegs) {
+    std::string lowerCasePhyName = TRI->getName(phyreg); 
+    std::transform(lowerCasePhyName.begin(), lowerCasePhyName.end(), lowerCasePhyName.begin(), ::tolower);
+    OS_arg << lowerCasePhyName << "(arg_" << (*m_pPhyreg2argIdx)[phyreg] << ") ";
+  }
+  OutStreamer->emitRawComment(OS_arg.str(), false);
+}
+
 /// EmitFunctionBody - This method emits the body and trailer for a
 /// function.
 void AsmPrinter::EmitFunctionBody() {
@@ -975,6 +1063,8 @@ void AsmPrinter::EmitFunctionBody() {
   EmitFunctionBodyStart();
 
   bool ShouldPrintDebugScopes = MMI->hasDebugInfo();
+
+  printSSPhyRegs();
 
   // Print out code for the function.
   bool HasAnyRealCode = false;
@@ -1000,40 +1090,67 @@ void AsmPrinter::EmitFunctionBody() {
         }
       }
 
-      if (isVerbose())
-        emitComments(MI, OutStreamer->GetCommentOS(), this);
+      Skippable canSkip = shouldSkip(MI);
+      if (canSkip) {
+        switch(canSkip) {
+        case SKIP_FOLDED_RELOADED:
+          MI.print(ymh_log() << "SKIP folded RELOAD:" << YMH_COLOR_BRIGHT_BLACK);
+          errs() << YMH_COLOR_RESET;
+          break;
 
-      switch (MI.getOpcode()) {
-      case TargetOpcode::CFI_INSTRUCTION:
-        emitCFIInstruction(MI);
-        break;
+        case SKIP_FOLDED_SPILL:
+          MI.print(ymh_log() << "SKIP folded SPILL:" << YMH_COLOR_BRIGHT_BLACK);
+          errs() << YMH_COLOR_RESET;
+          break;
+        case SKIP_ORR:
+          MI.print(ymh_log() << "SKIP ORR:" << YMH_COLOR_BRIGHT_BLACK);
+          errs() << YMH_COLOR_RESET;
+          break;
 
-      case TargetOpcode::LOCAL_ESCAPE:
-        emitFrameAlloc(MI);
-        break;
-
-      case TargetOpcode::EH_LABEL:
-      case TargetOpcode::GC_LABEL:
-        OutStreamer->EmitLabel(MI.getOperand(0).getMCSymbol());
-        break;
-      case TargetOpcode::INLINEASM:
-        EmitInlineAsm(&MI);
-        break;
-      case TargetOpcode::DBG_VALUE:
-        if (isVerbose()) {
-          if (!emitDebugValueComment(&MI, *this))
-            EmitInstruction(&MI);
+        default:
+          ymh_log() << "WHO ARE YOU?\n";
+          assert(false && "WHO ARE YOU?");
         }
-        break;
-      case TargetOpcode::IMPLICIT_DEF:
-        if (isVerbose()) emitImplicitDef(&MI);
-        break;
-      case TargetOpcode::KILL:
-        if (isVerbose()) emitKill(&MI, *this);
-        break;
-      default:
-        EmitInstruction(&MI);
-        break;
+      } else {
+
+        if (isVerbose()){
+          emitComments(MI, OutStreamer->GetCommentOS(), this);
+        }
+
+        switch (MI.getOpcode()) {
+        case TargetOpcode::CFI_INSTRUCTION:
+          emitCFIInstruction(MI);
+          break;
+
+        case TargetOpcode::LOCAL_ESCAPE:
+          ymh_log() << "Emit frame alloc\n";
+          emitFrameAlloc(MI);
+          break;
+
+        case TargetOpcode::EH_LABEL:
+        case TargetOpcode::GC_LABEL:
+          OutStreamer->EmitLabel(MI.getOperand(0).getMCSymbol());
+          break;
+        case TargetOpcode::INLINEASM:
+          EmitInlineAsm(&MI);
+          break;
+        case TargetOpcode::DBG_VALUE:
+          if (isVerbose()) {
+            if (!emitDebugValueComment(&MI, *this))
+              EmitInstruction(&MI);
+          }
+          break;
+        case TargetOpcode::IMPLICIT_DEF:
+          if (isVerbose()) emitImplicitDef(&MI);
+          break;
+        case TargetOpcode::KILL:
+          if (isVerbose()) emitKill(&MI, *this);
+          break;
+        default:
+          EmitInstruction(&MI);
+          // OutStreamer->emitRawComment("OP: " + Twine(MI.getOpcode()), false);
+          break;
+        }
       }
 
       if (ShouldPrintDebugScopes) {
@@ -2855,3 +2972,5 @@ uint16_t AsmPrinter::getDwarfVersion() const {
 void AsmPrinter::setDwarfVersion(uint16_t Version) {
   OutStreamer->getContext().setDwarfVersion(Version);
 }
+
+
