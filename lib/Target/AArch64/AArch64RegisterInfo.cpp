@@ -131,6 +131,9 @@ AArch64RegisterInfo::getReservedRegs(const MachineFunction &MF) const {
 
   if (hasBasePointer(MF))
     markSuperRegs(Reserved, AArch64::W19);
+  
+  markSuperRegs(Reserved, AArch64::W20);
+  markSuperRegs(Reserved, AArch64::W21);
 
   assert(checkAllSuperRegsMarked(Reserved));
   return Reserved;
@@ -143,6 +146,10 @@ bool AArch64RegisterInfo::isReservedReg(const MachineFunction &MF,
   switch (Reg) {
   default:
     break;
+  case AArch64::W20:
+  case AArch64::W21:
+  case AArch64::X20:
+  case AArch64::X21:
   case AArch64::SP:
   case AArch64::XZR:
   case AArch64::WSP:
