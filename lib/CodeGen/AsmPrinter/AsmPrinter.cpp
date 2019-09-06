@@ -714,7 +714,6 @@ void AsmPrinter::EmitFunctionHeader() {
     ymh_log() << F->getName() << " has PROLOGUE\n";
     EmitGlobalConstant(F->getParent()->getDataLayout(), F->getPrologueData());
   }
-  OutStreamer->GetCommentOS() << "End of EmitFunctionHeader\n";
 }
 
 /// EmitFunctionEntryLabel - Emit the label that is the entrypoint for the

@@ -478,8 +478,6 @@ namespace {
       if (m_ssLocalVarsArgs[0]) F.m_withSSData = Function::WITH_SS_DATA;
       else F.m_withSSData = Function::WITHOUT_SS_DATA;
 
-
-
       ///////////////// <6>
       // add ss_saveCleanV & ss_readV 
       // add ss_saveM & ss_readM
